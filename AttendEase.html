@@ -1,0 +1,2058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AttendEase — TUM</title>
+  <meta name="description" content="Technical University of Mombasa — Smart Attendance Management System"/>
+
+  <!-- React + ReactDOM (production CDN) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone — transpiles JSX in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- QR code generator -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <!-- jsQR — QR scanner -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+
+  <style>
+    body { margin: 0; padding: 0; font-family: sans-serif; background: #F0F4FF; }
+    #root { min-height: 100vh; }
+    #loading {
+      position: fixed; inset: 0;
+      background: linear-gradient(145deg,#0a0f2e,#1e3a8a,#0369a1);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      color: #fff; font-family: sans-serif; z-index: 9999;
+      transition: opacity .4s;
+    }
+    #loading h1 { font-size: 36px; font-weight: 800; letter-spacing: -.04em; margin: 0 0 6px; }
+    #loading p  { font-size: 13px; opacity: .5; margin: 0 0 28px; }
+    .ld-ring {
+      width: 40px; height: 40px; border-radius: 50%;
+      border: 3px solid rgba(255,255,255,.2);
+      border-top-color: #fff;
+      animation: ldspin 1s linear infinite;
+    }
+    @keyframes ldspin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<!-- Loading screen shown while Babel compiles -->
+<div id="loading">
+  <h1>AttendEase</h1>
+  <p>Technical University of Mombasa</p>
+  <div class="ld-ring"></div>
+</div>
+
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+// ─── Pull React hooks into scope (Babel standalone doesn't support imports) ───
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+const UNIT_DURATION  = 3;           // hours per class
+const LATE_MINS      = 15;          // minutes past start = late
+const MAX_CANCELS    = 3;           // consecutive cancels before admin alert
+const LATE_POLICY    = 3;           // N lates = 1 absence
+const WARN_AT        = [75, 70, 65];
+const SESSION_KEY    = "tum_ae_v6";
+const DEVICE_KEY     = "tum_device";
+const AUDIT_KEY      = "tum_audit";
+const SYNC_KEY       = "tum_sync";
+const MOCK_MODE      = true;
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
+const getDeviceId  = () => { let d=localStorage.getItem(DEVICE_KEY); if(!d){d="DEV-"+uid();localStorage.setItem(DEVICE_KEY,d);} return d; };
+const saveSession  = d  => { try{localStorage.setItem(SESSION_KEY,JSON.stringify({...d,deviceId:getDeviceId(),at:Date.now()}));}catch{} };
+const loadSession  = () => { try{return JSON.parse(localStorage.getItem(SESSION_KEY));}catch{return null;} };
+const clearSession = () => { try{localStorage.removeItem(SESSION_KEY);}catch{} };
+const loadAudit    = () => { try{return JSON.parse(localStorage.getItem(AUDIT_KEY))||[];}catch{return[];} };
+const writeAudit   = (actor,action,detail) => { const a=loadAudit(); a.unshift({id:uid(),actor,action,detail,at:nowISO()}); try{localStorage.setItem(AUDIT_KEY,JSON.stringify(a.slice(0,600)));}catch{}; };
+const loadSyncQ    = () => { try{return JSON.parse(localStorage.getItem(SYNC_KEY))||[];}catch{return[];} };
+const pushSyncQ    = r  => { const q=loadSyncQ(); q.push(r); try{localStorage.setItem(SYNC_KEY,JSON.stringify(q));}catch{}; };
+const clearSyncQ   = () => { try{localStorage.removeItem(SYNC_KEY);}catch{}; };
+
+// ── General helpers ───────────────────────────────────────────────────────────
+const uid         = () => Math.random().toString(36).slice(2,10).toUpperCase();
+const delay       = ms => new Promise(r=>setTimeout(r,ms));
+const nowISO      = () => new Date().toISOString();
+const todayStr    = () => new Date().toISOString().slice(0,10);
+const todayDow    = () => ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
+const fmtTime     = iso => iso?new Date(iso).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}):"—";
+const fmtFull     = iso => new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+const elapsed     = iso => { const s=Math.floor((Date.now()-new Date(iso))/1000); return s<60?"just now":s<3600?`${Math.floor(s/60)}m ago`:`${Math.floor(s/3600)}h ago`; };
+const addHrs      = (t,h) => { const [hh,mm]=t.split(":").map(Number),tot=hh*60+mm+h*60; return `${String(Math.floor(tot/60)%24).padStart(2,"0")}:${String(tot%60).padStart(2,"0")}`; };
+const bonusMark   = p => p>=95?10:p>=90?9:p>=85?8:p>=80?7:p>=75?6:p>=70?5:p>=65?4:p>=60?3:p>=50?2:p>=40?1:0;
+const standing    = p => p>=95?{l:"Perfect",c:"#F59E0B",i:"🏆"}:p>=85?{l:"Excellent",c:"#059669",i:"⭐"}:p>=75?{l:"Good",c:"#2563EB",i:"✓"}:p>=60?{l:"Satisfactory",c:"#F97316",i:"~"}:{l:"At Risk",c:"#DC2626",i:"⚠"};
+const unitColor   = id => ({MAT301:"#6366f1",CSC301:"#0ea5e9",ELE301:"#10b981",COM301:"#f59e0b",PHY301:"#ef4444"})[id]||"#64748b";
+const DAYS        = ["Mon","Tue","Wed","Thu","Fri"];
+const TIMES       = ["07:00","08:00","09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00"];
+
+function slotStatus(tt) {
+  const now=new Date(), dow=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][now.getDay()];
+  if(tt.day!==dow||tt.cancelled) return {live:false,status:tt.cancelled?"cancelled":"other"};
+  const [h,m]=tt.startTime.split(":").map(Number);
+  const start=new Date(now); start.setHours(h,m,0,0);
+  const end=new Date(start.getTime()+UNIT_DURATION*3600000);
+  const diff=(now-start)/60000;
+  if(diff<-5) return {live:false,status:"upcoming",minsUntil:Math.ceil(-diff)};
+  if(now>end) return {live:false,status:"ended"};
+  return {live:true,late:diff>LATE_MINS,minsIn:Math.floor(diff),status:"live"};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MOCK DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+const INIT_CLASSES = [
+  {id:"CL01",code:"BSCS/SEP/2024",name:"BSc Computer Science",       intakeYear:2024,intakeSem:"September",currentYear:2,students:["S001","S002","S003"],hodId:"H01"},
+  {id:"CL02",code:"BSIT/JAN/2024",name:"BSc Information Technology", intakeYear:2024,intakeSem:"January",  currentYear:2,students:["S004","S005"],        hodId:"H01"},
+];
+const INIT_STUDENTS = {
+  S001:{id:"S001",name:"Amina Hassan",   adm:"SCT211-0001/2024",email:"amina@students.tum.ac.ke",   photo:"AH",classId:"CL01",status:"active",regStatus:"registered"},
+  S002:{id:"S002",name:"Brian Otieno",   adm:"SCT211-0002/2024",email:"brian@students.tum.ac.ke",   photo:"BO",classId:"CL01",status:"active",regStatus:"registered"},
+  S003:{id:"S003",name:"Cynthia Mwangi", adm:"SCT211-0003/2024",email:"cynthia@students.tum.ac.ke", photo:"CM",classId:"CL01",status:"active",regStatus:"registered"},
+  S004:{id:"S004",name:"David Kamau",    adm:"SCT211-0004/2024",email:"david@students.tum.ac.ke",   photo:"DK",classId:"CL02",status:"active",regStatus:"registered"},
+  S005:{id:"S005",name:"Esther Njeri",   adm:"SCT211-0005/2024",email:"esther@students.tum.ac.ke",  photo:"EN",classId:"CL02",status:"deferred",regStatus:"deferred"},
+};
+const INIT_LECTURERS = {
+  L01:{id:"L01",name:"Dr. Omondi", email:"omondi@tum.ac.ke", dept:"Mathematics",photo:"DO"},
+  L02:{id:"L02",name:"Ms. Wanjiku",email:"wanjiku@tum.ac.ke",dept:"Computing",  photo:"WJ"},
+  L03:{id:"L03",name:"Dr. Muthui", email:"muthui@tum.ac.ke", dept:"Engineering",photo:"DM"},
+  L04:{id:"L04",name:"Mr. Kamau",  email:"kamau@tum.ac.ke",  dept:"Languages",  photo:"MK"},
+};
+const COORDINATORS = { H01:{id:"H01",name:"Prof. Ndung'u",email:"hod.soc@tum.ac.ke",dept:"School of Computing & IT"} };
+const INIT_UNITS = [
+  {id:"MAT301",name:"Engineering Mathematics III", code:"MAT 301",lecturerId:"L01",creditHours:3,classIds:["CL01","CL02"],active:true},
+  {id:"CSC301",name:"Data Structures & Algorithms",code:"CSC 301",lecturerId:"L02",creditHours:3,classIds:["CL01"],       active:true},
+  {id:"ELE301",name:"Electronics I",               code:"ELE 301",lecturerId:"L03",creditHours:3,classIds:["CL02"],       active:true},
+  {id:"COM301",name:"Communication Skills",         code:"COM 301",lecturerId:"L04",creditHours:2,classIds:["CL01","CL02"],active:true},
+  {id:"PHY301",name:"Engineering Physics",          code:"PHY 301",lecturerId:"L03",creditHours:3,classIds:["CL02"],       active:true},
+];
+const INIT_TT = [
+  {id:"TT01",unitId:"MAT301",classId:"CL01",day:"Mon",startTime:"08:00",room:"B-12",  type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT02",unitId:"MAT301",classId:"CL01",day:"Wed",startTime:"08:00",room:"B-12",  type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT03",unitId:"MAT301",classId:"CL02",day:"Fri",startTime:"08:00",room:"B-14",  type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT04",unitId:"CSC301",classId:"CL01",day:"Tue",startTime:"10:00",room:"IT Lab",type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT05",unitId:"CSC301",classId:"CL01",day:"Thu",startTime:"10:00",room:"IT Lab",type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT06",unitId:"ELE301",classId:"CL02",day:"Mon",startTime:"13:00",room:"Lab 2", type:"practical",semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT07",unitId:"ELE301",classId:"CL02",day:"Thu",startTime:"13:00",room:"Lab 2", type:"practical",semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT08",unitId:"COM301",classId:"CL01",day:"Tue",startTime:"14:00",room:"A-04",  type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT09",unitId:"COM301",classId:"CL02",day:"Fri",startTime:"14:00",room:"A-04",  type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+  {id:"TT10",unitId:"PHY301",classId:"CL02",day:"Wed",startTime:"11:00",room:"Lab 1", type:"lecture",  semester:"Sem 2 2025",cancelled:false,isMakeup:false,cancelledDates:[]},
+];
+const CREDS = {
+  "admin@tum.ac.ke":   {role:"admin",   pw:"admin123",id:"ADMIN"},
+  "omondi@tum.ac.ke":  {role:"lecturer",pw:"lec123",  id:"L01"},
+  "wanjiku@tum.ac.ke": {role:"lecturer",pw:"lec123",  id:"L02"},
+  "muthui@tum.ac.ke":  {role:"lecturer",pw:"lec123",  id:"L03"},
+  "kamau@tum.ac.ke":   {role:"lecturer",pw:"lec123",  id:"L04"},
+  "SCT211-0001/2024":  {role:"student", pw:"demo",    id:"S001"},
+  "SCT211-0002/2024":  {role:"student", pw:"demo",    id:"S002"},
+  "SCT211-0003/2024":  {role:"student", pw:"demo",    id:"S003"},
+  "SCT211-0004/2024":  {role:"student", pw:"demo",    id:"S004"},
+  "SCT211-0005/2024":  {role:"student", pw:"demo",    id:"S005"},
+};
+
+function genHistory(units, classes, timetable) {
+  const recs=[], lecRecs=[];
+  const start=new Date("2025-01-20"), end=new Date("2025-03-01");
+  for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+    const dow=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()];
+    if(dow==="Sun"||dow==="Sat") continue;
+    const ds=d.toISOString().slice(0,10);
+    timetable.forEach(tt=>{
+      if(tt.day!==dow||tt.cancelled) return;
+      const unit=units.find(u=>u.id===tt.unitId);
+      const cls=classes.find(c=>c.id===tt.classId);
+      if(!unit||!cls) return;
+      const lecPresent=Math.random()<0.91;
+      if(lecPresent) lecRecs.push({id:uid(),lecturerId:unit.lecturerId,ttId:tt.id,unitId:tt.unitId,classId:tt.classId,date:ds,time:new Date(d).toISOString()});
+      if(lecPresent) cls.students.forEach(sId=>{
+        if(Math.random()<0.82){
+          const late=Math.random()<0.11;
+          recs.push({id:uid(),studentId:sId,ttId:tt.id,unitId:tt.unitId,classId:tt.classId,date:ds,time:new Date(d).toISOString(),status:late?"late":"present",penalty:0,penaltyNote:"",synced:true});
+        }
+      });
+    });
+  }
+  return {recs,lecRecs};
+}
+
+async function mockMoodleLogin(u,p){
+  await delay(800);
+  const c=CREDS[u.trim()];
+  if(!c||c.pw!==p) return {ok:false};
+  return {ok:true,role:c.role,id:c.id,token:"mock_"+uid(),username:u.trim()};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GLOBAL CSS
+// ═══════════════════════════════════════════════════════════════════════════════
+const CSS=`
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Sora',sans-serif;background:#F0F4FF;color:#0F1B35}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#CBD5F0;border-radius:4px}
+.card{background:#fff;border-radius:18px;padding:22px;box-shadow:0 2px 20px rgba(15,27,53,.08)}
+.card-sm{background:#fff;border-radius:12px;padding:14px;box-shadow:0 1px 8px rgba(15,27,53,.06)}
+.btn{cursor:pointer;border:none;border-radius:11px;padding:11px 20px;font-family:'Sora',sans-serif;font-size:13px;font-weight:600;transition:all .16s;display:inline-flex;align-items:center;gap:6px}
+.btn:active{transform:scale(.97)}.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-blue{background:#2563EB;color:#fff}.btn-blue:hover:not(:disabled){background:#1d4fd8;box-shadow:0 4px 12px rgba(37,99,235,.3)}
+.btn-green{background:#059669;color:#fff}.btn-green:hover:not(:disabled){background:#047857}
+.btn-amber{background:#D97706;color:#fff}.btn-amber:hover:not(:disabled){background:#b45309}
+.btn-red{background:#DC2626;color:#fff}.btn-red:hover:not(:disabled){background:#b91c1c}
+.btn-purple{background:#7C3AED;color:#fff}.btn-purple:hover:not(:disabled){background:#6d28d9}
+.btn-ghost{background:#EEF2FF;color:#2563EB}.btn-ghost:hover:not(:disabled){background:#E0E7FF}
+.btn-dark{background:#0a0f2e;color:#fff}.btn-dark:hover:not(:disabled){background:#1e3a8a}
+.btn-outline{background:transparent;border:1.5px solid #E0E7FF;color:#64748b}.btn-outline:hover:not(:disabled){border-color:#2563EB;color:#2563EB}
+.btn-sm{padding:6px 12px!important;font-size:12px!important;border-radius:8px!important}
+.btn-live{background:linear-gradient(135deg,#DC2626,#ef4444)!important;color:#fff!important;animation:lpulse 2s infinite}
+@keyframes lpulse{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.4)}50%{box-shadow:0 0 0 8px rgba(220,38,38,0)}}
+.input{background:#F8FAFF;border:1.5px solid #E0E7FF;border-radius:10px;padding:10px 13px;color:#0F1B35;font-family:'Sora',sans-serif;font-size:13px;width:100%;outline:none;transition:border .2s}
+.input:focus{border-color:#2563EB;background:#fff}
+select.input option{background:#fff}
+textarea.input{resize:vertical;min-height:70px}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+.modal-bg{position:fixed;inset:0;background:rgba(10,15,46,.6);display:flex;align-items:center;justify-content:center;z-index:2000;padding:16px;backdrop-filter:blur(4px)}
+.modal{background:#fff;border-radius:20px;padding:28px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 64px rgba(0,0,0,.22)}
+.slide-in{animation:si .22s ease}@keyframes si{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.pop-in{animation:pi .3s cubic-bezier(.34,1.5,.64,1)}@keyframes pi{from{opacity:0;transform:scale(.88)}to{opacity:1;transform:scale(1)}}
+.spin{animation:sp 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+.live-dot{width:8px;height:8px;border-radius:50%;background:#059669;display:inline-block;animation:ld 2s infinite}
+@keyframes ld{0%,100%{box-shadow:0 0 0 0 rgba(5,150,105,.5)}50%{box-shadow:0 0 0 5px rgba(5,150,105,0)}}
+.drawer{position:fixed;top:0;left:0;bottom:0;width:268px;background:#0a0f2e;z-index:900;transform:translateX(-100%);transition:transform .25s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;box-shadow:4px 0 24px rgba(0,0,0,.3)}
+.drawer.open{transform:translateX(0)}
+.drawer-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:899;opacity:0;pointer-events:none;transition:opacity .25s}
+.drawer-bg.open{opacity:1;pointer-events:auto}
+.nav-item{display:flex;align-items:center;gap:10px;padding:11px 16px;color:rgba(255,255,255,.58);cursor:pointer;border-radius:10px;margin:2px 8px;transition:all .15s;font-size:13.5px;font-weight:500;border:none;background:none;width:calc(100% - 16px);text-align:left}
+.nav-item:hover{background:rgba(255,255,255,.07);color:rgba(255,255,255,.9)}
+.nav-item.active{background:rgba(37,99,235,.28);color:#fff}
+.notif-panel{position:fixed;top:0;right:0;bottom:0;width:340px;background:#fff;box-shadow:-4px 0 30px rgba(0,0,0,.14);z-index:800;display:flex;flex-direction:column;animation:npin .22s ease}
+@keyframes npin{from{transform:translateX(100%)}to{transform:translateX(0)}}
+.scan-ring{position:absolute;inset:-8px;border-radius:50%;border:3px solid rgba(37,99,235,.2);animation:scanring 2s linear infinite}
+@keyframes scanring{to{transform:rotate(360deg)}}
+.scan-line{position:absolute;left:4%;right:4%;height:2px;background:linear-gradient(90deg,transparent,#2563EB,transparent);animation:scanline 1.8s linear infinite;pointer-events:none;z-index:2}
+@keyframes scanline{0%{top:6%}100%{top:92%}}
+table{width:100%;border-collapse:collapse}
+th{padding:9px 13px;text-align:left;font-size:11px;font-weight:600;color:#6B7FBD;letter-spacing:.07em;background:#F8FAFF}
+th:first-child{border-radius:8px 0 0 8px}th:last-child{border-radius:0 8px 8px 0}
+td{padding:10px 13px;font-size:13px;border-bottom:1px solid #F0F4FF;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+.tt-cell{border-radius:8px;padding:6px 8px;font-size:11px;font-weight:600;cursor:pointer;border:none;width:100%;text-align:left;margin-bottom:2px;transition:filter .15s}
+.tt-cell:hover{filter:brightness(.93)}
+`;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ROOT
+// ═══════════════════════════════════════════════════════════════════════════════
+function App(){
+  const qrReady=useScript("https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js","QRCode");
+
+  const [session,    setSession]    = useState(()=>loadSession());
+  const [classes,    setClasses]    = useState(INIT_CLASSES);
+  const [students,   setStudents]   = useState(INIT_STUDENTS);
+  const [units,      setUnits]      = useState(INIT_UNITS);
+  const [timetable,  setTimetable]  = useState(INIT_TT);
+  const [notifs,     setNotifs]     = useState([]);
+  const [reminders,  setReminders]  = useState([]);
+  const [semLocked,  setSemLocked]  = useState(false);
+  const histRef = useRef(false);
+
+  const [records,    setRecords]    = useState([]);
+  const [lecRecs,    setLecRecs]    = useState([]);
+
+  useEffect(()=>{
+    if(histRef.current) return; histRef.current=true;
+    const {recs,lecRecs}=genHistory(INIT_UNITS,INIT_CLASSES,INIT_TT);
+    setRecords(recs); setLecRecs(lecRecs);
+  },[]);
+
+  // ── Online/offline sync ─────────────────────────────────────────────────
+  useEffect(()=>{
+    const run=()=>{
+      const q=loadSyncQ(); if(!q.length) return;
+      setRecords(prev=>{
+        const ids=new Set(prev.map(r=>r.id));
+        return [...prev,...q.filter(r=>!ids.has(r.id)).map(r=>({...r,synced:true}))];
+      });
+      clearSyncQ();
+    };
+    window.addEventListener("online",run);
+    run();
+    return()=>window.removeEventListener("online",run);
+  },[]);
+
+  // ── Midnight Moodle sync simulation ────────────────────────────────────
+  useEffect(()=>{
+    const doSync=()=>{
+      if(!navigator.onLine){ pushSyncQ({type:"moodle_sync",at:nowISO()}); return; }
+      setStudents(prev=>{
+        const updated={...prev};
+        Object.keys(updated).forEach(id=>{
+          // In production: call moodle API — here we leave status as-is
+          updated[id]={...updated[id],lastMoodleSync:todayStr()};
+        });
+        return updated;
+      });
+      writeAudit("SYSTEM","Moodle sync","Nightly student registration sync completed");
+    };
+    const now=new Date();
+    const midnight=new Date(now); midnight.setHours(24,0,0,0);
+    const msUntil=midnight-now;
+    const t=setTimeout(()=>{ doSync(); setInterval(doSync,86400000); },msUntil);
+    return()=>clearTimeout(t);
+  },[]);
+
+  const pushNotif=useCallback((toIds,title,body,type="info")=>{
+    setNotifs(prev=>[{id:uid(),toIds,title,body,type,time:nowISO()},...prev]);
+  },[]);
+
+  const addReminder=useCallback((ttId,mins)=>{
+    setReminders(prev=>{
+      if(prev.find(r=>r.ttId===ttId&&r.userId===session?.id)) return prev;
+      return [...prev,{id:uid(),ttId,userId:session?.id,mins}];
+    });
+    if(Notification.permission==="default") Notification.requestPermission();
+  },[session]);
+
+  const removeReminder=useCallback(ttId=>{
+    setReminders(prev=>prev.filter(r=>!(r.ttId===ttId&&r.userId===session?.id)));
+  },[session]);
+
+  // Reminder check every 30s
+  useEffect(()=>{
+    if(!session) return;
+    const check=()=>{
+      const now=new Date(), dow=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][now.getDay()];
+      timetable.forEach(tt=>{
+        if(tt.day!==dow||tt.cancelled) return;
+        reminders.filter(r=>r.ttId===tt.id&&r.userId===session.id).forEach(r=>{
+          const [h,m]=tt.startTime.split(":").map(Number);
+          const start=new Date(now); start.setHours(h,m,0,0);
+          const diff=(start-now)/60000;
+          const key=`rem_${r.id}_${todayStr()}`;
+          if(Math.abs(diff-r.mins)<0.6&&!sessionStorage.getItem(key)){
+            sessionStorage.setItem(key,"1");
+            const unit=units.find(u=>u.id===tt.unitId);
+            if(Notification.permission==="granted") new Notification(`⏰ Class in ${r.mins} min`,{body:`${unit?.name} — ${tt.room}`});
+            pushNotif([session.id],"⏰ Class Reminder",`${unit?.name} starts in ${r.mins} min — ${tt.room}`,"reminder");
+          }
+        });
+      });
+    };
+    const iv=setInterval(check,30000);
+    return()=>clearInterval(iv);
+  },[session,timetable,reminders,units,pushNotif]);
+
+  const login=useCallback(async(u,p)=>{
+    const res=await mockMoodleLogin(u,p);
+    if(!res.ok) return {ok:false};
+    const sess={role:res.role,id:res.id,username:res.username,token:res.token,deviceId:getDeviceId()};
+    saveSession(sess); setSession(sess);
+    writeAudit(res.id,"Login",`Signed in as ${res.role} from device ${getDeviceId()}`);
+    return {ok:true};
+  },[]);
+
+  const logout=useCallback(()=>{ writeAudit(session?.id||"?","Logout","Session ended"); clearSession(); setSession(null); },[session]);
+
+  const shared={session,logout,classes,setClasses,students,setStudents,units,setUnits,timetable,setTimetable,notifs,records,setRecords,lecRecs,setLecRecs,reminders,addReminder,removeReminder,pushNotif,qrReady,semLocked,setSemLocked,writeAudit};
+
+  if(!session) return <><style>{CSS}</style><LoginPage login={login}/></>;
+
+  return(
+    <>
+      <style>{CSS}</style>
+      {session.role==="student"  && <StudentApp  {...shared}/>}
+      {session.role==="lecturer" && <LecturerApp {...shared}/>}
+      {session.role==="admin"    && <AdminApp    {...shared}/>}
+    </>
+  );
+}
+
+function useScript(src,key){
+  const[ready,setReady]=useState(false);
+  useEffect(()=>{
+    if(window[key]){setReady(true);return;}
+    const s=document.createElement("script");s.src=src;s.onload=()=>setReady(true);document.head.appendChild(s);
+  },[]);
+  return ready;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LOGIN
+// ═══════════════════════════════════════════════════════════════════════════════
+function LoginPage({login}){
+  const[tab,setTab]=useState("student");
+  const[user,setUser]=useState(""),[ pass,setPass]=useState("");
+  const[err,setErr]=useState(""),[ loading,setLoading]=useState(false);
+  const cfg={student:{icon:"🎓",label:"Student",color:"#2563EB",ph:"SCT211-0001/2024"},lecturer:{icon:"🏫",label:"Lecturer",color:"#059669",ph:"omondi@tum.ac.ke"},admin:{icon:"🛡",label:"Admin",color:"#7C3AED",ph:"admin@tum.ac.ke"}};
+  const demos={student:[["SCT211-0001/2024","demo"],["SCT211-0002/2024","demo"]],lecturer:[["omondi@tum.ac.ke","lec123"],["wanjiku@tum.ac.ke","lec123"]],admin:[["admin@tum.ac.ke","admin123"]]};
+  const submit=async()=>{
+    setLoading(true);setErr("");
+    const res=await login(user,pass);
+    setLoading(false);
+    if(!res.ok){setErr("Invalid credentials. Check your TUM eLearning username and password.");return;}
+  };
+  return(
+    <div style={{minHeight:"100vh",background:"linear-gradient(145deg,#0a0f2e 0%,#1e3a8a 55%,#0369a1 100%)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{width:"100%",maxWidth:420}}>
+        <div style={{textAlign:"center",color:"#fff",marginBottom:28}}>
+          <div style={{background:"rgba(255,255,255,.08)",borderRadius:12,padding:"8px 18px",display:"inline-block",marginBottom:12}}><span style={{fontSize:12,fontWeight:700,letterSpacing:".12em",opacity:.8}}>TECHNICAL UNIVERSITY OF MOMBASA</span></div>
+          <h1 style={{fontSize:38,fontWeight:800,letterSpacing:"-.04em"}}>AttendEase</h1>
+          <p style={{color:"rgba(255,255,255,.5)",fontSize:13,marginTop:6}}>Powered by elearning.tum.ac.ke</p>
+        </div>
+        <div style={{display:"flex",gap:5,background:"rgba(255,255,255,.08)",borderRadius:14,padding:5,marginBottom:20}}>
+          {Object.entries(cfg).map(([k,v])=>(
+            <button key={k} onClick={()=>{setTab(k);setErr("");setUser("");setPass("");}} style={{flex:1,border:"none",borderRadius:10,padding:"10px 4px",cursor:"pointer",fontFamily:"'Sora',sans-serif",fontSize:12,fontWeight:600,transition:"all .17s",background:tab===k?"#fff":"transparent",color:tab===k?v.color:"rgba(255,255,255,.6)",boxShadow:tab===k?"0 2px 8px rgba(0,0,0,.12)":"none"}}>
+              {v.icon} {v.label}
+            </button>
+          ))}
+        </div>
+        <div className="card">
+          <div style={{textAlign:"center",marginBottom:18}}>
+            <div style={{fontSize:32,marginBottom:6}}>{cfg[tab].icon}</div>
+            <h2 style={{fontWeight:700,fontSize:17,color:cfg[tab].color}}>{cfg[tab].label} Sign In</h2>
+            <p style={{fontSize:12,color:"#94a3b8",marginTop:3}}>Uses your TUM eLearning credentials</p>
+          </div>
+          {err&&<div style={{background:"#FEE2E2",borderRadius:10,padding:"9px 13px",fontSize:13,color:"#DC2626",marginBottom:12}}>{err}</div>}
+          <Fld label={tab==="student"?"ADMISSION NUMBER":"EMAIL"}><input className="input" placeholder={cfg[tab].ph} value={user} onChange={e=>setUser(e.target.value)} style={{marginBottom:0}}/></Fld>
+          <Fld label="PASSWORD"><input className="input" type="password" placeholder="Your eLearning password" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/></Fld>
+          <button className="btn btn-dark" style={{width:"100%",fontSize:14,padding:13,background:cfg[tab].color,marginTop:4}} onClick={submit} disabled={loading||!user||!pass}>
+            {loading?<><Spinner/>Verifying with TUM…</>:`Sign in as ${cfg[tab].label} →`}
+          </button>
+          <div style={{marginTop:14,background:"#F8FAFF",borderRadius:10,padding:"10px 13px"}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#94a3b8",marginBottom:6,letterSpacing:".06em"}}>DEMO CREDENTIALS (click to fill)</div>
+            {demos[tab].map(([u,p],i)=>(
+              <div key={i} onClick={()=>{setUser(u);setPass(p);}} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:i<demos[tab].length-1?"1px solid #F0F4FF":"none",cursor:"pointer",fontSize:12}}>
+                <span style={{fontFamily:"'JetBrains Mono',monospace",color:"#2563EB"}}>{u}</span><span style={{color:"#94a3b8"}}>{p}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SHARED SHELL — hamburger drawer + topbar + notif panel
+// ═══════════════════════════════════════════════════════════════════════════════
+function Shell({session,logout,notifs,navItems,activeTab,setActiveTab,children,accent="#2563EB"}){
+  const[drawerOpen,setDrawer]=useState(false);
+  const[notifOpen,setNotif]=useState(false);
+  const myNotifs=notifs.filter(n=>n.toIds==="all"||n.toIds?.includes(session.id)||(n.toIds==="students"&&session.role==="student")||(n.toIds==="lecturers"&&session.role==="lecturer"));
+  const unread=myNotifs.length;
+  const typeColor={reschedule:"#D97706",reminder:"#2563EB",appeal:"#DC2626",warning:"#DC2626",info:"#059669",penalty:"#7C3AED"};
+  return(
+    <div style={{minHeight:"100vh",background:"#F0F4FF",display:"flex",flexDirection:"column"}}>
+      {/* Topbar */}
+      <div style={{background:"#0a0f2e",height:54,display:"flex",alignItems:"center",padding:"0 16px",gap:12,position:"sticky",top:0,zIndex:700,flexShrink:0}}>
+        <button onClick={()=>setDrawer(true)} style={{background:"none",border:"none",cursor:"pointer",color:"rgba(255,255,255,.7)",fontSize:20,padding:"4px 6px",lineHeight:1}}>☰</button>
+        <div style={{color:"#fff",fontWeight:800,fontSize:16,flex:1}}>Attend<span style={{color:accent}}>Ease</span> <span style={{fontSize:11,fontWeight:400,opacity:.4}}>TUM</span></div>
+        <div style={{fontSize:12,color:"rgba(255,255,255,.35)",marginRight:4}}>Sem 2 · 2025</div>
+        <button onClick={()=>setNotif(v=>!v)} style={{position:"relative",background:"none",border:"none",cursor:"pointer",fontSize:20,color:"rgba(255,255,255,.7)",padding:"4px"}}>
+          🔔{unread>0&&<span style={{position:"absolute",top:-2,right:-2,background:"#DC2626",color:"#fff",borderRadius:20,padding:"0 4px",fontSize:10,fontWeight:700,lineHeight:"15px"}}>{unread}</span>}
+        </button>
+      </div>
+
+      {/* Drawer overlay */}
+      <div className={`drawer-bg${drawerOpen?" open":""}`} onClick={()=>setDrawer(false)}/>
+
+      {/* Drawer */}
+      <div className={`drawer${drawerOpen?" open":""}`}>
+        <div style={{padding:"20px 16px 8px",borderBottom:"1px solid rgba(255,255,255,.07)"}}>
+          <div style={{color:"#fff",fontWeight:800,fontSize:17}}>Attend<span style={{color:accent}}>Ease</span></div>
+          <div style={{color:"rgba(255,255,255,.35)",fontSize:11,marginTop:1}}>TUM · elearning.tum.ac.ke</div>
+          <div style={{marginTop:12,background:"rgba(255,255,255,.06)",borderRadius:11,padding:"9px 12px",display:"flex",alignItems:"center",gap:9}}>
+            <Av i={session.role==="admin"?"AD":session.role==="lecturer"?INIT_LECTURERS[session.id]?.photo||"LEC":INIT_STUDENTS[session.id]?.photo||"STU"} size={32} g={`135deg,${accent},${accent}99`}/>
+            <div>
+              <div style={{color:"#fff",fontWeight:600,fontSize:12}}>{session.role==="admin"?"Super Admin":session.role==="lecturer"?INIT_LECTURERS[session.id]?.name:INIT_STUDENTS[session.id]?.name}</div>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:10}}>{session.role==="student"?INIT_STUDENTS[session.id]?.adm:session.username}</div>
+            </div>
+          </div>
+        </div>
+        <nav style={{flex:1,padding:"8px 0",overflowY:"auto"}}>
+          {navItems.map(item=>(
+            <button key={item.id} className={`nav-item${activeTab===item.id?" active":""}`} onClick={()=>{setActiveTab(item.id);setDrawer(false);}}>
+              <span style={{fontSize:15}}>{item.icon}</span><span style={{flex:1}}>{item.label}</span>
+              {item.badge>0&&<span style={{background:"#DC2626",color:"#fff",borderRadius:20,padding:"0 6px",fontSize:10,fontWeight:700}}>{item.badge}</span>}
+            </button>
+          ))}
+        </nav>
+        <div style={{padding:8,borderTop:"1px solid rgba(255,255,255,.07)"}}>
+          <button className="nav-item" style={{color:"rgba(255,100,100,.7)"}} onClick={()=>{setDrawer(false);logout();}}>🚪 Sign Out</button>
+        </div>
+      </div>
+
+      {/* Main content */}
+      <div style={{flex:1,padding:"20px 18px",maxWidth:1100,margin:"0 auto",width:"100%"}}>
+        {children}
+      </div>
+
+      {/* Notif panel */}
+      {notifOpen&&(
+        <div className="notif-panel">
+          <div style={{padding:"14px 18px",borderBottom:"1px solid #E0E7FF",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontWeight:700,fontSize:15}}>Notifications <span className="live-dot" style={{marginLeft:4}}/></div>
+            <button onClick={()=>setNotif(false)} style={{background:"none",border:"none",cursor:"pointer",fontSize:18,color:"#94a3b8"}}>✕</button>
+          </div>
+          <div style={{flex:1,overflowY:"auto",padding:12}}>
+            {myNotifs.length===0?<div style={{textAlign:"center",padding:"40px 20px",color:"#94a3b8"}}><div style={{fontSize:32,marginBottom:8}}>🔔</div>No notifications yet.</div>
+            :myNotifs.map(n=>(
+              <div key={n.id} style={{padding:"11px 13px",borderRadius:11,background:n.type==="reschedule"||n.type==="warning"?"#FEF9C3":n.type==="reminder"?"#EEF2FF":n.type==="penalty"?"#F3E8FF":"#F8FAFF",marginBottom:8,borderLeft:`3px solid ${typeColor[n.type]||"#94a3b8"}`}}>
+                <div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{n.title}</div>
+                <div style={{fontSize:12,color:"#64748b",lineHeight:1.45}}>{n.body}</div>
+                <div style={{fontSize:11,color:"#94a3b8",marginTop:4}}>{elapsed(n.time)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STUDENT APP
+// ═══════════════════════════════════════════════════════════════════════════════
+function StudentApp(props){
+  const{session,notifs,records,units,classes,timetable,pushNotif,addReminder,removeReminder,reminders}=props;
+  const student=INIT_STUDENTS[session.id];
+  const myNotifs=notifs.filter(n=>n.toIds==="all"||n.toIds?.includes(session.id)||n.toIds==="students");
+  const[tab,setTab]=useState("scan");
+
+  // Check if student is deferred/suspended
+  if(student?.status==="deferred"||student?.regStatus==="deferred"){
+    return(
+      <Shell {...props} navItems={[]} activeTab="scan" setActiveTab={()=>{}} accent="#DC2626">
+        <div className="card" style={{maxWidth:400,margin:"60px auto",textAlign:"center",padding:40}}>
+          <div style={{fontSize:44,marginBottom:12}}>⚠️</div>
+          <h2 style={{fontWeight:700,fontSize:18,color:"#DC2626",marginBottom:8}}>Account Suspended</h2>
+          <p style={{color:"#64748b",fontSize:13,lineHeight:1.6}}>Your registration status on elearning.tum.ac.ke is <strong>deferred</strong>. Please visit the registry to resolve this before you can mark attendance.</p>
+        </div>
+      </Shell>
+    );
+  }
+
+  const navItems=[
+    {id:"scan",     icon:"📷",label:"Scan QR Attendance",badge:0},
+    {id:"timetable",icon:"📅",label:"My Timetable",      badge:0},
+    {id:"attendance",icon:"✓",label:"My Attendance",     badge:0},
+    {id:"units",    icon:"📚",label:"My Units",          badge:0},
+    {id:"notifs",   icon:"🔔",label:"Notifications",     badge:myNotifs.length},
+  ];
+
+  return(
+    <Shell {...props} navItems={navItems} activeTab={tab} setActiveTab={setTab} accent="#2563EB">
+      {tab==="scan"       && <StudentScan      {...props} student={student} goToScan={()=>setTab("scan")}/>}
+      {tab==="timetable"  && <StudentTimetable {...props} student={student} goToScan={()=>setTab("scan")}/>}
+      {tab==="attendance" && <StudentAttendance{...props} student={student}/>}
+      {tab==="units"      && <StudentUnits     {...props} student={student}/>}
+      {tab==="notifs"     && <NotifList notifs={myNotifs}/>}
+    </Shell>
+  );
+}
+
+// ─── Student: Scan QR ────────────────────────────────────────────────────────
+function StudentScan({session,units,classes,timetable,records,setRecords,students,pushNotif,qrReady}){
+  const student=INIT_STUDENTS[session.id]||students[session.id];
+  const cls=INIT_CLASSES.find(c=>c.id===student?.classId);
+  // Find live or upcoming classes for this student
+  const myUnitIds=new Set(units.filter(u=>u.active&&u.classIds.includes(student?.classId||"")).map(u=>u.id));
+  const mySlots=timetable.filter(t=>myUnitIds.has(t.unitId)&&t.classId===student?.classId);
+  const liveSlots=mySlots.map(t=>({...t,_status:slotStatus(t)})).filter(t=>t._status.live);
+  const upcomingSlots=mySlots.map(t=>({...t,_status:slotStatus(t)})).filter(t=>t._status.status==="upcoming").sort((a,b)=>a._status.minsUntil-b._status.minsUntil);
+
+  const[scanning,setScanning]=useState(false);
+  const[result,setResult]=useState(null);
+  const[checkingStatus,setCheckingStatus]=useState(false);
+  const[statusResult,setStatusResult]=useState(null);
+  const videoRef=useRef(null); const canvasRef=useRef(null); const animRef=useRef(null);
+
+  const doCheckIn=async(ttId,isLate)=>{
+    const tt=timetable.find(t=>t.id===ttId);
+    if(!tt) return {ok:false,reason:"not_found"};
+    const unit=units.find(u=>u.id===tt.unitId);
+    // Check session open (lecturer must have scanned)
+    const sessionOpen=window.__openSessions?.[ttId];
+    if(!sessionOpen) return {ok:false,reason:"not_open"};
+    // One scan per session lock
+    const already=records.find(r=>r.studentId===session.id&&r.ttId===ttId&&r.date===todayStr());
+    if(already) return {ok:false,reason:"already",status:already.status};
+    const rec={id:uid(),studentId:session.id,ttId,unitId:tt.unitId,classId:tt.classId,date:todayStr(),time:nowISO(),status:isLate?"late":"present",penalty:0,penaltyNote:"",synced:navigator.onLine};
+    if(!navigator.onLine) pushQueue(rec);
+    setRecords(prev=>[...prev,rec]);
+    // At-risk check
+    const allRecs=[...records,rec];
+    const unitRecs=allRecs.filter(r=>r.studentId===session.id&&r.unitId===tt.unitId);
+    const totalSlots=timetable.filter(t=>t.unitId===tt.unitId&&t.classId===tt.classId&&!t.cancelled).length;
+    const attended=unitRecs.filter(r=>r.status==="present"||r.status==="late").length;
+    const pct=totalSlots>0?Math.round(attended/totalSlots*100):100;
+    WARN_AT.forEach(w=>{
+      const key=`warned_${session.id}_${tt.unitId}_${w}`;
+      if(pct<=w&&!sessionStorage.getItem(key)){
+        sessionStorage.setItem(key,"1");
+        pushNotif([session.id,`HOD_${cls?.hodId||"H01"}`],`⚠ Attendance Warning`,`Your attendance in ${unit?.name} has dropped to ${pct}% — minimum recommended is 75%.`,"warning");
+      }
+    });
+    writeAudit(session.id,"Check-in",`Marked ${isLate?"late":"present"} for ${unit?.name} on ${todayStr()}`);
+    return {ok:true,status:rec.status,unit,pct,bonus:bonusMark(pct),standing:standing(pct)};
+  };
+
+  const startScan=()=>{
+    setScanning(true); setResult(null);
+    setTimeout(()=>{
+      if(!videoRef.current) return;
+      navigator.mediaDevices?.getUserMedia({video:{facingMode:"environment"}}).then(stream=>{
+        videoRef.current.srcObject=stream;
+        videoRef.current.play();
+        tick();
+      }).catch(()=>{ setScanning(false); alert("Camera access denied. Please allow camera and retry."); });
+    },200);
+  };
+
+  const stopScan=(stream)=>{
+    if(animRef.current) cancelAnimationFrame(animRef.current);
+    if(videoRef.current?.srcObject) videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
+    setScanning(false);
+  };
+
+  const tick=()=>{
+    if(!videoRef.current||!canvasRef.current) return;
+    const v=videoRef.current,c=canvasRef.current,ctx=c.getContext("2d");
+    if(v.readyState===v.HAVE_ENOUGH_DATA){
+      c.width=v.videoWidth; c.height=v.videoHeight;
+      ctx.drawImage(v,0,0);
+      const img=ctx.getImageData(0,0,c.width,c.height);
+      if(window.jsQR){
+        const code=window.jsQR(img.data,img.width,img.height);
+        if(code?.data?.startsWith("ATTENDEASE:COURSE:")){
+          const ttId=code.data.slice(18);
+          stopScan();
+          const tt=timetable.find(t=>t.id===ttId);
+          if(!tt){setResult({ok:false,reason:"invalid_qr"});return;}
+          const st=slotStatus(tt);
+          if(!st.live){setResult({ok:false,reason:"class_closed",detail:st});return;}
+          doCheckIn(ttId,st.late).then(r=>setResult(r));
+          return;
+        }
+      }
+    }
+    animRef.current=requestAnimationFrame(tick);
+  };
+
+  // Demo: simulate scanning without camera
+  const demoScan=(ttId)=>{
+    const tt=timetable.find(t=>t.id===ttId);
+    if(!tt) return;
+    const st=slotStatus(tt);
+    if(!st.live){
+      // For demo, force-open the session and fake live status
+      window.__openSessions=window.__openSessions||{};
+      window.__openSessions[ttId]=true;
+      doCheckIn(ttId,false).then(r=>setResult(r));
+      return;
+    }
+    doCheckIn(ttId,st.late).then(r=>setResult(r));
+  };
+
+  const checkStatus=(ttId)=>{
+    setCheckingStatus(true);
+    const rec=records.find(r=>r.studentId===session.id&&r.ttId===ttId&&r.date===todayStr());
+    setTimeout(()=>{ setCheckingStatus(false); setStatusResult(rec||null); },600);
+  };
+
+  if(result) return <ScanResult result={result} student={student} onBack={()=>setResult(null)}/>;
+
+  return(
+    <div className="slide-in">
+      <div style={{marginBottom:18}}>
+        <h2 style={{fontWeight:800,fontSize:20}}>Scan QR Attendance</h2>
+        <p style={{fontSize:13,color:"#64748b",marginTop:3}}>{cls?.code} · {student?.name}</p>
+      </div>
+
+      {/* Live classes */}
+      {liveSlots.length>0&&(
+        <div style={{marginBottom:16}}>
+          {liveSlots.map(tt=>{
+            const unit=units.find(u=>u.id===tt.unitId);
+            const alreadyIn=records.find(r=>r.studentId===session.id&&r.ttId===tt.id&&r.date===todayStr());
+            return(
+              <div key={tt.id} className="card" style={{borderLeft:"4px solid #DC2626",marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
+                  <div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                      <span className="live-dot"/><span style={{fontSize:12,fontWeight:700,color:"#DC2626"}}>LIVE NOW</span>
+                      {tt._status.late&&<span className="badge" style={{background:"#FEF3C7",color:"#92400E"}}>⚠ {tt._status.minsIn} min in — Late if scanning now</span>}
+                    </div>
+                    <div style={{fontWeight:700,fontSize:16}}>{unit?.name}</div>
+                    <div style={{fontSize:12,color:"#64748b"}}>{unit?.code} · {tt.room} · until {addHrs(tt.startTime,UNIT_DURATION)}</div>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {alreadyIn
+                      ? <span className="badge" style={{background:"#D1FAE5",color:"#065F46",fontSize:13,padding:"8px 14px"}}>✓ Marked {alreadyIn.status}</span>
+                      : <>
+                          <button className="btn btn-live" onClick={startScan}>📷 Scan QR</button>
+                          <button className="btn btn-ghost btn-sm" onClick={()=>demoScan(tt.id)}>Demo scan</button>
+                        </>
+                    }
+                    <button className="btn btn-outline btn-sm" onClick={()=>checkStatus(tt.id)} disabled={checkingStatus}>
+                      {checkingStatus?<Spinner/>:"🔍 Check Status"}
+                    </button>
+                  </div>
+                </div>
+                {statusResult!==undefined&&statusResult!==null&&(
+                  <div style={{marginTop:10,background:"#D1FAE5",borderRadius:10,padding:"8px 14px",fontSize:13,color:"#065F46"}}>
+                    ✓ Attendance confirmed — marked <strong>{statusResult.status}</strong> at {fmtTime(statusResult.time)}
+                  </div>
+                )}
+                {statusResult===null&&(
+                  <div style={{marginTop:10,background:"#FEE2E2",borderRadius:10,padding:"8px 14px",fontSize:13,color:"#DC2626"}}>
+                    ✗ Not yet marked for this session
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* No live class */}
+      {liveSlots.length===0&&(
+        <div className="card" style={{textAlign:"center",padding:"36px 24px",marginBottom:16}}>
+          <div style={{fontSize:44,marginBottom:10}}>📷</div>
+          <h3 style={{fontWeight:700,fontSize:17,marginBottom:6}}>No live class right now</h3>
+          <p style={{color:"#64748b",fontSize:13,lineHeight:1.6,marginBottom:16}}>When a class is in session, a <span style={{color:"#DC2626",fontWeight:600}}>LIVE NOW</span> button will appear above. Your lecturer must open the session first by scanning the class QR.</p>
+          {upcomingSlots.length>0&&(
+            <div style={{background:"#EEF2FF",borderRadius:12,padding:"12px 16px",textAlign:"left"}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#6B7FBD",marginBottom:8}}>NEXT CLASSES</div>
+              {upcomingSlots.slice(0,3).map(tt=>{
+                const u=units.find(x=>x.id===tt.unitId);
+                return(
+                  <div key={tt.id} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid #E0E7FF",fontSize:13}}>
+                    <span style={{fontWeight:600}}>{u?.code}</span>
+                    <span style={{color:"#64748b"}}>{tt.day} {tt.startTime} · {tt.room}</span>
+                    <span style={{color:"#2563EB",fontWeight:600}}>in {tt._status.minsUntil}m</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Camera scanner */}
+      {scanning&&(
+        <div className="modal-bg">
+          <div className="modal pop-in" style={{maxWidth:340,textAlign:"center"}}>
+            <h3 style={{fontWeight:700,marginBottom:12}}>Point at the classroom QR</h3>
+            <div style={{position:"relative",width:"100%",aspectRatio:"1",background:"#000",borderRadius:14,overflow:"hidden"}}>
+              <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"cover"}} playsInline muted/>
+              <canvas ref={canvasRef} style={{display:"none"}}/>
+              <div className="scan-line"/>
+              <div style={{position:"absolute",inset:0,border:"2px solid rgba(37,99,235,.5)",borderRadius:14,pointerEvents:"none"}}/>
+            </div>
+            <button className="btn btn-red" style={{width:"100%",marginTop:14}} onClick={stopScan}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScanResult({result,student,onBack}){
+  const{ok,reason,status,unit,pct,bonus,standing:std,detail}=result;
+  if(!ok){
+    const msgs={
+      not_open:"The lecturer hasn't opened this session yet. Please wait for your lecturer to scan first.",
+      already:`You're already marked as ${result.status} for this class today.`,
+      class_closed: detail?.status==="upcoming"?`Class hasn't started yet. Opens in ${detail.minsUntil} min.`:detail?.status==="ended"?"Check-in window has closed for this class.":"This class is not scheduled today.",
+      not_found:"Invalid QR code — please use the printed classroom QR.",
+      invalid_qr:"QR code not recognised. Make sure you're scanning the classroom QR.",
+    };
+    return(
+      <div className="card pop-in" style={{maxWidth:380,margin:"0 auto",textAlign:"center",padding:36}}>
+        <div style={{fontSize:44,marginBottom:10}}>{reason==="already"?"✅":"⛔"}</div>
+        <h2 style={{fontWeight:700,fontSize:17,color:reason==="already"?"#059669":"#DC2626",marginBottom:8}}>{reason==="already"?"Already Checked In":"Cannot Check In"}</h2>
+        <p style={{color:"#64748b",fontSize:13,lineHeight:1.6,marginBottom:18}}>{msgs[reason]||"Something went wrong. Please try again."}</p>
+        <button className="btn btn-blue" style={{width:"100%"}} onClick={onBack}>← Back</button>
+      </div>
+    );
+  }
+  const isLate=status==="late";
+  return(
+    <div className="card pop-in" style={{maxWidth:380,margin:"0 auto",textAlign:"center",padding:36}}>
+      <div style={{width:64,height:64,borderRadius:"50%",background:isLate?"linear-gradient(135deg,#D97706,#F59E0B)":"linear-gradient(135deg,#059669,#34d399)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:700,color:"#fff",margin:"0 auto 10px"}}>{student?.photo}</div>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:".1em",color:isLate?"#D97706":"#059669",marginBottom:4}}>{isLate?"⚠ LATE ARRIVAL":"✓ ATTENDANCE MARKED"}</div>
+      <h2 style={{fontSize:22,fontWeight:800,marginBottom:2}}>{student?.name}</h2>
+      <div style={{fontSize:13,color:"#64748b",marginBottom:2}}>{student?.adm}</div>
+      <div style={{fontSize:13,fontWeight:600,color:"#2563EB",marginBottom:16}}>{unit?.name} · {fmtTime(nowISO())}</div>
+      {std&&(
+        <div style={{background:`${std.c}0e`,border:`1.5px solid ${std.c}28`,borderRadius:14,padding:14,marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:600,color:std.c,letterSpacing:".08em"}}>{std.i} {std.l}</div>
+          <div style={{fontSize:30,fontWeight:800,color:"#0F1B35",margin:"4px 0"}}>{pct}<span style={{fontSize:16}}>%</span></div>
+          <div style={{fontSize:12,color:"#64748b"}}>Semester attendance</div>
+          <div style={{marginTop:8,display:"inline-block",background:"#EEF2FF",borderRadius:8,padding:"5px 14px",fontSize:13,fontWeight:700,color:"#2563EB"}}>+{bonus} bonus marks</div>
+        </div>
+      )}
+      <button className="btn btn-ghost" style={{width:"100%"}} onClick={onBack}>← Done</button>
+    </div>
+  );
+}
+
+// ─── Student: Timetable ────────────────────────────────────────────────────────
+function StudentTimetable({session,units,classes,timetable,records,reminders,addReminder,removeReminder,students,goToScan}){
+  const student=INIT_STUDENTS[session.id]||students[session.id];
+  const myUnitIds=new Set(units.filter(u=>u.active&&u.classIds.includes(student?.classId||"")).map(u=>u.id));
+  const mySlots=timetable.filter(t=>myUnitIds.has(t.unitId)&&t.classId===student?.classId);
+  const[reminderModal,setReminderModal]=useState(null);
+  const[selDay,setSelDay]=useState(todayDow()||"Mon");
+
+  const daySlots=mySlots.filter(t=>t.day===selDay).sort((a,b)=>a.startTime.localeCompare(b.startTime));
+
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:800,fontSize:20,marginBottom:16}}>My Timetable</h2>
+      {/* Day tabs */}
+      <div style={{display:"flex",gap:6,marginBottom:18,overflowX:"auto",paddingBottom:4}}>
+        {DAYS.map(d=>{
+          const hasLive=mySlots.some(t=>t.day===d&&slotStatus(t).live);
+          return(
+            <button key={d} onClick={()=>setSelDay(d)} style={{border:"none",borderRadius:10,padding:"9px 18px",cursor:"pointer",fontFamily:"'Sora',sans-serif",fontSize:13,fontWeight:600,flexShrink:0,background:selDay===d?"#0a0f2e":"#fff",color:selDay===d?"#fff":hasLive?"#DC2626":"#64748b",boxShadow:selDay===d?"0 4px 12px rgba(10,15,46,.2)":"0 1px 4px rgba(0,0,0,.06)",position:"relative"}}>
+              {d}{d===todayDow()&&<span style={{position:"absolute",top:3,right:3,width:6,height:6,borderRadius:"50%",background:hasLive?"#DC2626":"#2563EB"}}/>}
+            </button>
+          );
+        })}
+      </div>
+
+      {daySlots.length===0?<div className="card" style={{textAlign:"center",padding:36,color:"#94a3b8"}}>No classes scheduled on {selDay}.</div>
+      :daySlots.map(tt=>{
+        const unit=units.find(u=>u.id===tt.unitId);
+        const st=slotStatus(tt);
+        const col=unitColor(tt.unitId);
+        const hasRem=reminders.some(r=>r.ttId===tt.id&&r.userId===session.id);
+        const todayRec=records.find(r=>r.studentId===session.id&&r.ttId===tt.id&&r.date===todayStr());
+        return(
+          <div key={tt.id} className="card" style={{marginBottom:12,borderLeft:`4px solid ${tt.isMakeup?"#059669":tt.cancelled?"#DC2626":col}`,opacity:tt.cancelled?.7:1}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
+              <div>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:col,fontWeight:700}}>{unit?.code}</span>
+                  {tt.isMakeup&&<span className="badge" style={{background:"#D1FAE5",color:"#065F46"}}>🔄 Make-up</span>}
+                  {tt.cancelled&&<span className="badge" style={{background:"#FEE2E2",color:"#DC2626"}}>❌ Cancelled</span>}
+                  {st.live&&<span className="badge" style={{background:"#FEE2E2",color:"#DC2626",animation:"lpulse 2s infinite"}}>🔴 LIVE</span>}
+                  {st.status==="upcoming"&&d===todayDow()&&<span className="badge" style={{background:"#EEF2FF",color:"#2563EB"}}>in {st.minsUntil}m</span>}
+                </div>
+                <div style={{fontWeight:700,fontSize:15}}>{unit?.name}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{tt.startTime} – {addHrs(tt.startTime,UNIT_DURATION)} · {tt.room} · {tt.type}</div>
+                {todayRec&&<div style={{fontSize:12,color:"#059669",marginTop:3,fontWeight:600}}>✓ {todayRec.status==="late"?"Late":"Present"} at {fmtTime(todayRec.time)}</div>}
+              </div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                {st.live&&!todayRec&&<button className="btn btn-live btn-sm" onClick={goToScan}>📷 Scan Now</button>}
+                {!tt.cancelled&&<button onClick={()=>setReminderModal(tt)} style={{background:"none",border:"1.5px solid #E0E7FF",borderRadius:8,padding:"6px 10px",cursor:"pointer",fontSize:16,color:hasRem?"#D97706":"#94a3b8"}} title={hasRem?"Edit reminder":"Set reminder"}>{hasRem?"🔔":"🔕"}</button>}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+
+      {reminderModal&&(
+        <div className="modal-bg" onClick={()=>setReminderModal(null)}>
+          <div className="modal pop-in" style={{maxWidth:320,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:34,marginBottom:8}}>⏰</div>
+            <h3 style={{fontWeight:700,fontSize:16,marginBottom:4}}>{units.find(u=>u.id===reminderModal.unitId)?.name}</h3>
+            <p style={{fontSize:13,color:"#64748b",marginBottom:14}}>{reminderModal.day} · {reminderModal.startTime} · {reminderModal.room}</p>
+            <p style={{fontSize:13,color:"#64748b",marginBottom:12}}>Remind me before this class:</p>
+            {[5,10,15,30,60].map(m=>(
+              <button key={m} className="btn btn-ghost" style={{width:"100%",marginBottom:8,fontSize:14,justifyContent:"center"}} onClick={()=>{addReminder(reminderModal.id,m);setReminderModal(null);}}>⏰ {m} minutes before</button>
+            ))}
+            {reminders.some(r=>r.ttId===reminderModal.id&&r.userId===session.id)&&(
+              <button className="btn btn-red" style={{width:"100%",marginBottom:8}} onClick={()=>{removeReminder(reminderModal.id);setReminderModal(null);}}>🔕 Remove Reminder</button>
+            )}
+            <button className="btn btn-outline" style={{width:"100%"}} onClick={()=>setReminderModal(null)}>Close</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function selDay_todayDow(day){return day===todayDow();}
+
+// ─── Student: Attendance ─────────────────────────────────────────────────────
+function StudentAttendance({session,units,timetable,records,students}){
+  const student=INIT_STUDENTS[session.id]||students[session.id];
+  const myUnits=units.filter(u=>u.active&&u.classIds.includes(student?.classId||""));
+  const[sel,setSel]=useState(null);
+
+  const getStats=(unitId)=>{
+    const slots=timetable.filter(t=>t.unitId===unitId&&t.classId===student?.classId&&!t.cancelled);
+    const today=new Date(), start=new Date("2025-01-20");
+    let totalHeld=0;
+    slots.forEach(tt=>{
+      for(let d=new Date(start);d<=today;d.setDate(d.getDate()+1)){
+        const dow=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()];
+        if(dow===tt.day) totalHeld++;
+      }
+    });
+    const unitRecs=records.filter(r=>r.studentId===session.id&&r.unitId===unitId);
+    const attended=unitRecs.filter(r=>r.status==="present"||r.status==="late").length;
+    const lateCount=unitRecs.filter(r=>r.status==="late").length;
+    const absences=totalHeld-attended;
+    const effectiveLates=Math.floor(lateCount/LATE_POLICY);
+    const effectiveAbsences=absences+effectiveLates;
+    const pct=totalHeld>0?Math.round(attended/totalHeld*100):0;
+    const bonus=bonusMark(pct);
+    const penalties=unitRecs.reduce((a,r)=>a+((r.penalty||0)*(r.penaltyForgiven?0:1)),0);
+    const net=Math.max(0,bonus-penalties);
+    const remaining=slots.filter(tt=>{
+      const dow=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][today.getDay()];
+      return true; // simplified
+    }).length;
+    const projectedPct=totalHeld>0?Math.round((attended+remaining)/Math.max(totalHeld+remaining,1)*100):0;
+    return{totalHeld,attended,absent:absences,lateCount,effectiveAbsences,pct,bonus,penalties,net,projectedPct,std:standing(pct)};
+  };
+
+  const allStats=myUnits.map(u=>({u,st:getStats(u.id)}));
+  const avgPct=allStats.length?Math.round(allStats.reduce((a,x)=>a+x.st.pct,0)/allStats.length):0;
+  const totalBonus=allStats.reduce((a,x)=>a+x.st.net,0);
+
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:800,fontSize:20,marginBottom:16}}>My Attendance</h2>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:18}}>
+        {[["Overall",`${avgPct}%`,"#2563EB"],["Net Marks",`+${totalBonus}`,"#059669"],["Units",myUnits.length,"#F59E0B"]].map(([l,v,c])=>(
+          <div key={l} className="card" style={{textAlign:"center",borderTop:`3px solid ${c}`}}>
+            <div style={{fontSize:26,fontWeight:800,color:c}}>{v}</div>
+            <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{l}</div>
+          </div>
+        ))}
+      </div>
+      {allStats.map(({u,st})=>(
+        <div key={u.id} className="card" style={{marginBottom:12,cursor:"pointer",border:sel===u.id?"2px solid #2563EB":"2px solid transparent"}} onClick={()=>setSel(sel===u.id?null:u.id)}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div><div style={{fontWeight:700,fontSize:15}}>{u.name}</div><div style={{fontSize:12,color:"#64748b"}}>{u.code}</div></div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontSize:22,fontWeight:800,color:st.pct>=75?"#059669":st.pct>=60?"#F59E0B":"#DC2626"}}>{st.pct}%</div>
+              <div style={{fontSize:12,color:"#2563EB",fontWeight:600}}>net +{st.net}</div>
+            </div>
+          </div>
+          {sel===u.id&&(
+            <div className="slide-in" style={{marginTop:14}}>
+              <div style={{height:6,background:"#EEF2FF",borderRadius:99,overflow:"hidden",marginBottom:12}}>
+                <div style={{width:`${st.pct}%`,height:"100%",background:st.pct>=75?"#059669":st.pct>=60?"#F59E0B":"#DC2626",borderRadius:99,transition:"width .6s"}}/>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+                {[["Attended",st.attended,"#059669"],["Late",st.lateCount,"#D97706"],["Absent",st.absent,"#DC2626"]].map(([l,v,c])=>(
+                  <div key={l} className="card-sm" style={{textAlign:"center",padding:"8px 4px"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:c}}>{v}</div>
+                    <div style={{fontSize:10,color:"#94a3b8",marginTop:1}}>{l}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+                {[["Bonus",`+${st.bonus}`,"#2563EB"],["Penalty",`-${st.penalties}`,"#DC2626"],["Net",`+${st.net}`,"#059669"]].map(([l,v,c])=>(
+                  <div key={l} className="card-sm" style={{textAlign:"center",padding:"8px 4px",background:`${c}08`}}>
+                    <div style={{fontSize:18,fontWeight:800,color:c}}>{v}</div>
+                    <div style={{fontSize:10,color:"#94a3b8",marginTop:1}}>{l}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{padding:"9px 14px",borderRadius:10,background:`${st.std.c}0e`,border:`1px solid ${st.std.c}22`,marginBottom:8}}>
+                <div style={{fontWeight:600,color:st.std.c,fontSize:13}}>{st.std.i} {st.std.l}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:2}}>Projected end-of-semester: <strong>{st.projectedPct}%</strong> (if all remaining classes attended)</div>
+              </div>
+              <div style={{fontSize:11,color:"#94a3b8"}}>Policy: {LATE_POLICY} lates = 1 absence · Max penalty: -10</div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StudentUnits({session,units,timetable,students}){
+  const student=INIT_STUDENTS[session.id]||students[session.id];
+  const myUnits=units.filter(u=>u.active&&u.classIds.includes(student?.classId||""));
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:800,fontSize:20,marginBottom:16}}>My Units</h2>
+      {myUnits.map(u=>{
+        const lec=INIT_LECTURERS[u.lecturerId];
+        const slots=timetable.filter(t=>t.unitId===u.id&&t.classId===student?.classId);
+        return(
+          <div key={u.id} className="card" style={{marginBottom:12,borderLeft:`4px solid ${unitColor(u.id)}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+              <div>
+                <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:unitColor(u.id),fontWeight:700}}>{u.code}</span>
+                <div style={{fontWeight:700,fontSize:15,marginTop:2}}>{u.name}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:1}}>{lec?.name} · {u.creditHours} CH · 3 hrs/session</div>
+              </div>
+              <span className="badge" style={{background:"#D1FAE5",color:"#065F46"}}>Enrolled</span>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {slots.map(t=>(
+                <div key={t.id} style={{background:`${unitColor(u.id)}15`,borderRadius:8,padding:"5px 10px",fontSize:12,color:unitColor(u.id),fontWeight:600}}>
+                  {t.day} {t.startTime}–{addHrs(t.startTime,UNIT_DURATION)} · {t.room}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LECTURER APP
+// ═══════════════════════════════════════════════════════════════════════════════
+function LecturerApp(props){
+  const{session,notifs,records,units,timetable,pushNotif}=props;
+  const myNotifs=notifs.filter(n=>n.toIds==="all"||n.toIds?.includes(session.id)||n.toIds==="lecturers");
+  const myUnits=units.filter(u=>u.lecturerId===session.id&&u.active);
+  // Pending appeals = records with penalty > 0 that need review — simplified here as check-in appeals
+  const[tab,setTab]=useState("scan");
+
+  // Lecturer attendance %
+  const{lecRecs}=props;
+  const myLecRecs=lecRecs.filter(r=>r.lecturerId===session.id);
+  const mySlots=timetable.filter(t=>myUnits.some(u=>u.id===t.unitId));
+  const totalPossible=mySlots.filter(t=>!t.cancelled).length;
+  const lecPct=totalPossible>0?Math.round(myLecRecs.length/totalPossible*100):0;
+
+  const navItems=[
+    {id:"scan",     icon:"📷",label:"Scan to Open Session",badge:0},
+    {id:"register", icon:"📋",label:"Attendance Register", badge:0},
+    {id:"timetable",icon:"📅",label:"Timetable Manager",   badge:0},
+    {id:"units",    icon:"📚",label:"My Units",            badge:0},
+    {id:"penalties",icon:"⚖",label:"Penalties & Marks",   badge:0},
+    {id:"qr",       icon:"🖨",label:"QR Codes",            badge:0},
+    {id:"notifs",   icon:"🔔",label:"Notifications",       badge:myNotifs.length},
+  ];
+
+  return(
+    <Shell {...props} navItems={navItems} activeTab={tab} setActiveTab={setTab} accent="#059669">
+      {/* Attendance bar */}
+      <div style={{background:"linear-gradient(120deg,#0a0f2e,#1e3a8a)",borderRadius:16,padding:"14px 20px",marginBottom:20,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
+        <div>
+          <div style={{color:"rgba(255,255,255,.5)",fontSize:11,letterSpacing:".08em"}}>MY ATTENDANCE THIS SEMESTER</div>
+          <div style={{color:"#fff",fontWeight:700,fontSize:14,marginTop:2}}>{INIT_LECTURERS[session.id]?.name}</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:28,fontWeight:800,color:lecPct>=80?"#34d399":"#F59E0B"}}>{lecPct}%</div>
+            <div style={{fontSize:11,color:"rgba(255,255,255,.45)"}}>Classes delivered</div>
+          </div>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:700,color:"#fff"}}>{myLecRecs.length}/{totalPossible}</div>
+            <div style={{fontSize:11,color:"rgba(255,255,255,.45)"}}>Sessions opened</div>
+          </div>
+        </div>
+      </div>
+
+      {tab==="scan"      && <LecturerScan      {...props} myUnits={myUnits}/>}
+      {tab==="register"  && <LecturerRegister  {...props} myUnits={myUnits}/>}
+      {tab==="timetable" && <TimetableManager  {...props} myUnits={myUnits} role="lecturer"/>}
+      {tab==="units"     && <UnitManager       {...props} myUnits={myUnits} isAdmin={false}/>}
+      {tab==="penalties" && <PenaltyManager    {...props} myUnits={myUnits}/>}
+      {tab==="qr"        && <LecturerQR        {...props} myUnits={myUnits}/>}
+      {tab==="notifs"    && <NotifList notifs={myNotifs}/>}
+    </Shell>
+  );
+}
+
+// ─── Lecturer: Scan to open session ──────────────────────────────────────────
+function LecturerScan({session,units,timetable,lecRecs,setLecRecs,pushNotif,myUnits,qrReady}){
+  const mySlots=timetable.filter(t=>myUnits.some(u=>u.id===t.unitId)).map(t=>({...t,_status:slotStatus(t)}));
+  const liveSlots=mySlots.filter(t=>t._status.live);
+  const[opening,setOpening]=useState(null);
+
+  window.__openSessions=window.__openSessions||{};
+
+  const openSession=async(tt)=>{
+    setOpening(tt.id);
+    await delay(600);
+    window.__openSessions[tt.id]=true;
+    const already=lecRecs.find(r=>r.lecturerId===session.id&&r.ttId===tt.id&&r.date===todayStr());
+    if(!already){
+      const rec={id:uid(),lecturerId:session.id,ttId:tt.id,unitId:tt.unitId,classId:tt.classId,date:todayStr(),time:nowISO()};
+      setLecRecs(prev=>[...prev,rec]);
+      writeAudit(session.id,"Session open",`Opened attendance for ${units.find(u=>u.id===tt.unitId)?.name}`);
+    }
+    setOpening(null);
+  };
+
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:6}}>Open Attendance Session</h2>
+      <p style={{fontSize:13,color:"#64748b",marginBottom:18}}>Scan the class QR (kept by class rep) or tap to open — students cannot check in until you do this.</p>
+
+      {liveSlots.length===0?(
+        <div className="card" style={{textAlign:"center",padding:40,color:"#94a3b8"}}>
+          <div style={{fontSize:40,marginBottom:10}}>📋</div>
+          <div style={{fontWeight:600,marginBottom:4}}>No live classes right now</div>
+          <div style={{fontSize:12}}>Check your timetable for scheduled sessions.</div>
+        </div>
+      ):liveSlots.map(tt=>{
+        const unit=units.find(u=>u.id===tt.unitId);
+        const isOpen=!!window.__openSessions[tt.id];
+        const hasLecRec=lecRecs.find(r=>r.lecturerId===session.id&&r.ttId===tt.id&&r.date===todayStr());
+        return(
+          <div key={tt.id} className="card" style={{marginBottom:12,borderLeft:"4px solid #059669"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
+              <div>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:4}}>
+                  <span className="live-dot"/><span style={{fontSize:12,fontWeight:700,color:"#DC2626"}}>LIVE NOW</span>
+                </div>
+                <div style={{fontWeight:700,fontSize:16}}>{unit?.name}</div>
+                <div style={{fontSize:12,color:"#64748b"}}>{unit?.code} · {tt.room} · {tt.startTime}–{addHrs(tt.startTime,UNIT_DURATION)}</div>
+              </div>
+              {isOpen||hasLecRec
+                ?<span className="badge" style={{background:"#D1FAE5",color:"#065F46",fontSize:13,padding:"10px 16px"}}>✓ Session Open — Students can scan</span>
+                :<button className="btn btn-green" onClick={()=>openSession(tt)} disabled={opening===tt.id}>
+                  {opening===tt.id?<><Spinner/>Opening…</>:"📷 Scan QR / Open Session"}
+                </button>
+              }
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{background:"#F0FDF4",borderRadius:12,padding:"12px 16px",marginTop:8,fontSize:13,color:"#065F46",border:"1px solid #BBF7D0"}}>
+        💡 <strong>Tip:</strong> The printed class QR is kept by your class representative. Scanning it confirms your attendance and opens check-in for students. If no camera, tap "Open Session" directly.
+      </div>
+    </div>
+  );
+}
+
+// ─── Lecturer: Register ───────────────────────────────────────────────────────
+function LecturerRegister({session,units,classes,timetable,records,setRecords,myUnits,pushNotif,semLocked,writeAudit}){
+  const[selUnit,setSelUnit]=useState(myUnits[0]?.id||"");
+  const unit=units.find(u=>u.id===selUnit);
+  const unitClasses=classes.filter(c=>unit?.classIds.includes(c.id));
+  const[selClass,setSelClass]=useState(unitClasses[0]?.id||"");
+  const cls=classes.find(c=>c.id===selClass);
+  const enrolled=(cls?.students||[]).map(id=>INIT_STUDENTS[id]).filter(Boolean).filter(s=>s.status!=="deferred");
+  const todayRecs=records.filter(r=>r.unitId===selUnit&&r.classId===selClass&&r.date===todayStr());
+  const presentIds=new Set(todayRecs.map(r=>r.studentId));
+
+  const mark=(studentId,status)=>{
+    if(semLocked) return;
+    if(records.find(r=>r.studentId===studentId&&r.unitId===selUnit&&r.classId===selClass&&r.date===todayStr())) return;
+    const rec={id:uid(),studentId,ttId:"MANUAL",unitId:selUnit,classId:selClass,date:todayStr(),time:nowISO(),status,penalty:0,penaltyNote:"",synced:true};
+    setRecords(prev=>[...prev,rec]);
+    writeAudit(session.id,"Manual mark",`Marked ${INIT_STUDENTS[studentId]?.name} as ${status} in ${unit?.code}`);
+  };
+
+  const getStats=(studentId)=>{
+    const allSlots=timetable.filter(t=>t.unitId===selUnit&&t.classId===selClass&&!t.cancelled);
+    const today=new Date(),start=new Date("2025-01-20");
+    let total=0;
+    allSlots.forEach(tt=>{
+      for(let d=new Date(start);d<=today;d.setDate(d.getDate()+1)){
+        if(["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]===tt.day) total++;
+      }
+    });
+    const recs=records.filter(r=>r.studentId===studentId&&r.unitId===selUnit);
+    const attended=recs.filter(r=>r.status==="present"||r.status==="late").length;
+    const lateCount=recs.filter(r=>r.status==="late").length;
+    const pct=total>0?Math.round(attended/total*100):0;
+    return{total,attended,absent:total-attended,lateCount,pct,bonus:bonusMark(pct),std:standing(pct)};
+  };
+
+  const exportCSV=()=>{
+    const rows=[["Name","Adm No","Attended","Late","Absent","Total","Rate%","Bonus","Penalty","Net","Standing","Note"]];
+    enrolled.forEach(s=>{
+      const st=getStats(s.id);
+      const penalty=records.filter(r=>r.studentId===s.id&&r.unitId===selUnit).reduce((a,r)=>a+((r.penalty||0)*(r.penaltyForgiven?0:1)),0);
+      const net=Math.max(0,st.bonus-penalty);
+      rows.push([s.name,s.adm,st.attended,st.lateCount,st.absent,st.total,st.pct,st.bonus,penalty,net,st.std.l,""]);
+    });
+    if(semLocked){rows.push(["---","SEMESTER LOCKED — no edits permitted after this export"]);}
+    const csv=rows.map(r=>r.join(",")).join("\n");
+    const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);a.download=`${unit?.code}_${selClass}_Attendance.csv`;a.click();
+    writeAudit(session.id,"CSV Export",`Exported ${unit?.code} for ${cls?.code}`);
+  };
+
+  return(
+    <div className="slide-in">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <h2 style={{fontWeight:700,fontSize:18}}>Attendance Register</h2>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <select className="input" style={{width:"auto",fontSize:12}} value={selUnit} onChange={e=>setSelUnit(e.target.value)}>
+            {myUnits.map(u=><option key={u.id} value={u.id}>{u.code}</option>)}
+          </select>
+          <select className="input" style={{width:"auto",fontSize:12}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+            {unitClasses.map(c=><option key={c.id} value={c.id}>{c.code}</option>)}
+          </select>
+          <button className="btn btn-green btn-sm" onClick={exportCSV}>📥 Export CSV</button>
+        </div>
+      </div>
+      {semLocked&&<div style={{background:"#FEE2E2",borderRadius:10,padding:"9px 14px",fontSize:13,color:"#DC2626",marginBottom:12,fontWeight:600}}>🔒 Semester is locked — no edits permitted. Export only.</div>}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+        {[["Present",presentIds.size,"#059669"],["Absent",enrolled.length-presentIds.size,"#DC2626"],["Total",enrolled.length,"#2563EB"],["Today",todayStr().slice(5),"#64748b"]].map(([l,v,c])=>(
+          <div key={l} className="card-sm" style={{textAlign:"center",borderTop:`3px solid ${c}`}}>
+            <div style={{fontSize:20,fontWeight:800,color:c}}>{v}</div>
+            <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{l}</div>
+          </div>
+        ))}
+      </div>
+      <div className="card" style={{overflowX:"auto"}}>
+        <table>
+          <thead><tr><th>Student</th><th>Adm. No.</th><th>Time In</th><th>Status</th><th>Sem %</th><th>Bonus</th>{!semLocked&&<th>Mark</th>}</tr></thead>
+          <tbody>
+            {enrolled.map(s=>{
+              const rec=todayRecs.find(r=>r.studentId===s.id);
+              const st=getStats(s.id);
+              return(
+                <tr key={s.id}>
+                  <td><div style={{display:"flex",alignItems:"center",gap:8}}><Av i={s.photo} size={28}/><span style={{fontWeight:600}}>{s.name}</span></div></td>
+                  <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"#6B7FBD"}}>{s.adm}</td>
+                  <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11}}>{fmtTime(rec?.time)}</td>
+                  <td>
+                    {rec?<span className="badge" style={{background:rec.status==="late"?"#FEF3C7":"#D1FAE5",color:rec.status==="late"?"#92400E":"#065F46"}}>{rec.status==="late"?"⚠ Late":"✓ Present"}</span>
+                       :<span className="badge" style={{background:"#FEE2E2",color:"#DC2626"}}>✗ Absent</span>}
+                  </td>
+                  <td><Barpct pct={st.pct}/></td>
+                  <td style={{fontWeight:700,color:"#2563EB"}}>+{st.bonus}</td>
+                  {!semLocked&&<td style={{display:"flex",gap:5}}>
+                    {!rec&&<><button className="btn btn-green btn-sm" onClick={()=>mark(s.id,"present")}>Present</button><button className="btn btn-amber btn-sm" onClick={()=>mark(s.id,"late")}>Late</button></>}
+                  </td>}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Timetable Manager ────────────────────────────────────────────────────────
+function TimetableManager({session,units,classes,timetable,setTimetable,pushNotif,myUnits,role,semLocked}){
+  const visibleUnits=myUnits||units.filter(u=>u.active);
+  const visibleTT=timetable.filter(t=>visibleUnits.some(u=>u.id===t.unitId));
+  const[modal,setModal]=useState(null);
+  const[form,setForm]=useState({});
+  const[editing,setEditing]=useState(null);
+  const[selDay,setSelDay]=useState(todayDow()||"Mon");
+
+  const daySlots=visibleTT.filter(t=>t.day===selDay).sort((a,b)=>a.startTime.localeCompare(b.startTime));
+
+  const openAdd=()=>{ setForm({unitId:visibleUnits[0]?.id||"",classId:"",day:"Mon",startTime:"08:00",room:"",type:"lecture",semester:"Sem 2 2025",isMakeup:false}); setEditing(null); setModal("form"); };
+  const openEdit=tt=>{ setForm({...tt}); setEditing(tt); setModal("form"); };
+  const openCancel=tt=>{ setForm({...tt,cancelReason:""}); setModal("cancel"); };
+  const openMakeup=tt=>{ setForm({ttId:tt.id,unitId:tt.unitId,classId:tt.classId,day:"Mon",startTime:"08:00",room:tt.room,type:tt.type,semester:tt.semester,isMakeup:true}); setEditing(null); setModal("makeup"); };
+
+  const save=()=>{
+    if(!form.unitId||!form.day||!form.startTime||!form.room) return;
+    const unit=units.find(u=>u.id===form.unitId);
+    const cls=classes.find(c=>c.id===form.classId)||classes.find(c=>unit?.classIds.includes(c.id));
+    const entry={...form,classId:form.classId||cls?.id||"",cancelled:false};
+    if(editing){
+      const old=timetable.find(t=>t.id===editing.id);
+      setTimetable(prev=>prev.map(t=>t.id===editing.id?{...t,...entry}:t));
+      if(old.day!==entry.day||old.startTime!==entry.startTime||old.room!==entry.room){
+        const affectedStudents=classes.find(c=>c.id===entry.classId)?.students||[];
+        pushNotif([...affectedStudents],`📅 Class Rescheduled`,`${unit?.name} moved to ${entry.day} at ${entry.startTime} in ${entry.room}.`,"reschedule");
+        writeAudit(session.id,"Reschedule",`${unit?.code} moved to ${entry.day} ${entry.startTime}`);
+      }
+    } else {
+      setTimetable(prev=>[...prev,{...entry,id:uid(),cancelledDates:[]}]);
+      writeAudit(session.id,"Add slot",`Added ${unit?.code} ${entry.day} ${entry.startTime}`);
+    }
+    setModal(null);
+  };
+
+  const cancelSlot=()=>{
+    const tt=timetable.find(t=>t.id===form.id);
+    const unit=units.find(u=>u.id===tt?.unitId);
+    const affectedStudents=classes.find(c=>c.id===tt?.classId)?.students||[];
+    setTimetable(prev=>prev.map(t=>t.id===form.id?{...t,cancelled:true,cancelReason:form.cancelReason}:t));
+    pushNotif([...affectedStudents],`❌ Class Cancelled`,`${unit?.name} on ${tt?.day} at ${tt?.startTime} has been cancelled. ${form.cancelReason?"Reason: "+form.cancelReason:""}`.trim(),"reschedule");
+    // Check consecutive cancels
+    const unitCancels=timetable.filter(t=>t.unitId===tt?.unitId&&t.classId===tt?.classId&&t.cancelled).length+1;
+    const makeups=timetable.filter(t=>t.unitId===tt?.unitId&&t.isMakeup).length;
+    if(unitCancels-makeups>=MAX_CANCELS){
+      pushNotif(["ADMIN"],`⚠ ${MAX_CANCELS}+ Cancellations`,`${unit?.name} (${INIT_LECTURERS[unit?.lecturerId]?.name}) has ${unitCancels} cancellations with only ${makeups} make-up classes.`,"warning");
+    }
+    writeAudit(session.id,"Cancel class",`${unit?.code} ${tt?.day} ${tt?.startTime} cancelled — ${form.cancelReason}`);
+    setModal(null);
+  };
+
+  const addMakeup=()=>{
+    if(!form.day||!form.startTime||!form.room) return;
+    const unit=units.find(u=>u.id===form.unitId);
+    const affectedStudents=classes.find(c=>c.id===form.classId)?.students||[];
+    setTimetable(prev=>[...prev,{...form,id:uid(),cancelled:false,cancelledDates:[]}]);
+    pushNotif([...affectedStudents],`🔄 Make-up Class Added`,`${unit?.name} make-up on ${form.day} at ${form.startTime} in ${form.room}.`,"info");
+    writeAudit(session.id,"Makeup class",`${unit?.code} makeup added ${form.day} ${form.startTime}`);
+    setModal(null);
+  };
+
+  const deleteSlot=(id)=>{
+    if(!window.confirm("Remove this slot permanently?")) return;
+    setTimetable(prev=>prev.filter(t=>t.id!==id));
+    writeAudit(session.id,"Delete slot","Slot removed from timetable");
+  };
+
+  return(
+    <div className="slide-in">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <h2 style={{fontWeight:700,fontSize:18}}>Timetable Manager</h2>
+        {!semLocked&&<button className="btn btn-blue btn-sm" onClick={openAdd}>+ Add Slot</button>}
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:16,overflowX:"auto",paddingBottom:4}}>
+        {DAYS.map(d=>{
+          const hasLive=visibleTT.some(t=>t.day===d&&slotStatus(t).live);
+          return(
+            <button key={d} onClick={()=>setSelDay(d)} style={{border:"none",borderRadius:10,padding:"9px 18px",cursor:"pointer",fontFamily:"'Sora',sans-serif",fontSize:13,fontWeight:600,flexShrink:0,background:selDay===d?"#0a0f2e":"#fff",color:selDay===d?"#fff":hasLive?"#DC2626":"#64748b",boxShadow:selDay===d?"0 4px 12px rgba(0,0,0,.15)":"0 1px 4px rgba(0,0,0,.06)"}}>
+              {d}{d===todayDow()&&<span style={{marginLeft:4,fontSize:10,color:selDay===d?"rgba(255,255,255,.5)":"#94a3b8"}}>today</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {daySlots.length===0?<div className="card" style={{textAlign:"center",padding:32,color:"#94a3b8"}}>No classes on {selDay}.</div>
+      :daySlots.map(tt=>{
+        const unit=units.find(u=>u.id===tt.unitId);
+        const col=unitColor(tt.unitId);
+        const st=slotStatus(tt);
+        const cls=classes.find(c=>c.id===tt.classId);
+        return(
+          <div key={tt.id} className="card" style={{marginBottom:10,borderLeft:`4px solid ${tt.isMakeup?"#059669":tt.cancelled?"#DC2626":col}`,opacity:tt.cancelled?.65:1}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
+              <div>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:col,fontWeight:700}}>{unit?.code}</span>
+                  <span className="badge" style={{background:"#EEF2FF",color:"#4338CA",fontSize:10}}>{cls?.code}</span>
+                  {tt.isMakeup&&<span className="badge" style={{background:"#D1FAE5",color:"#065F46"}}>🔄 Make-up</span>}
+                  {tt.cancelled&&<span className="badge" style={{background:"#FEE2E2",color:"#DC2626"}}>❌ Cancelled</span>}
+                  {st.live&&<span className="badge" style={{background:"#FEE2E2",color:"#DC2626"}}>🔴 LIVE</span>}
+                </div>
+                <div style={{fontWeight:700,fontSize:15}}>{unit?.name}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{tt.startTime} – {addHrs(tt.startTime,UNIT_DURATION)} · {tt.room} · {tt.type}</div>
+                {tt.cancelReason&&<div style={{fontSize:12,color:"#DC2626",marginTop:2}}>Reason: {tt.cancelReason}</div>}
+              </div>
+              {!semLocked&&!tt.cancelled&&(
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button className="btn btn-ghost btn-sm" onClick={()=>openEdit(tt)}>✏ Edit</button>
+                  <button className="btn btn-amber btn-sm" onClick={()=>openCancel(tt)}>❌ Cancel</button>
+                  <button className="btn btn-green btn-sm" onClick={()=>openMakeup(tt)}>🔄 Makeup</button>
+                  <button className="btn btn-red btn-sm" style={{background:"#FEE2E2",color:"#DC2626"}} onClick={()=>deleteSlot(tt.id)}>🗑</button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Add/Edit modal */}
+      {(modal==="form"||modal==="makeup")&&(
+        <div className="modal-bg" onClick={()=>setModal(null)}>
+          <div className="modal pop-in" onClick={e=>e.stopPropagation()}>
+            <h3 style={{fontWeight:700,fontSize:17,marginBottom:18}}>{modal==="makeup"?"Add Make-up Class":editing?"Edit Slot":"Add Class Slot"}</h3>
+            <Fld label="UNIT">
+              <select className="input" value={form.unitId||""} onChange={e=>setForm(f=>({...f,unitId:e.target.value}))}>
+                {visibleUnits.map(u=><option key={u.id} value={u.id}>{u.code} — {u.name}</option>)}
+              </select>
+            </Fld>
+            <Fld label="CLASS">
+              <select className="input" value={form.classId||""} onChange={e=>setForm(f=>({...f,classId:e.target.value}))}>
+                <option value="">-- Select class --</option>
+                {classes.filter(c=>{const u=units.find(x=>x.id===form.unitId);return u?.classIds.includes(c.id);}).map(c=><option key={c.id} value={c.id}>{c.code} — {c.name}</option>)}
+              </select>
+            </Fld>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Fld label="DAY"><select className="input" value={form.day||"Mon"} onChange={e=>setForm(f=>({...f,day:e.target.value}))}>{DAYS.map(d=><option key={d}>{d}</option>)}</select></Fld>
+              <Fld label="START TIME"><select className="input" value={form.startTime||"08:00"} onChange={e=>setForm(f=>({...f,startTime:e.target.value}))}>{TIMES.map(t=><option key={t}>{t}</option>)}</select></Fld>
+            </div>
+            <Fld label="END TIME (auto)"><input className="input" value={addHrs(form.startTime||"08:00",UNIT_DURATION)} disabled style={{background:"#F0F4FF",color:"#94a3b8"}}/></Fld>
+            <Fld label="ROOM / VENUE"><input className="input" placeholder="e.g. B-12, IT Lab" value={form.room||""} onChange={e=>setForm(f=>({...f,room:e.target.value}))}/></Fld>
+            <Fld label="TYPE"><select className="input" value={form.type||"lecture"} onChange={e=>setForm(f=>({...f,type:e.target.value}))}>{["lecture","practical","tutorial","CAT"].map(t=><option key={t}>{t}</option>)}</select></Fld>
+            <div style={{display:"flex",gap:10,marginTop:8}}>
+              <button className="btn btn-blue" style={{flex:1}} onClick={modal==="makeup"?addMakeup:save}>Save</button>
+              <button className="btn btn-outline" onClick={()=>setModal(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cancel modal */}
+      {modal==="cancel"&&(
+        <div className="modal-bg" onClick={()=>setModal(null)}>
+          <div className="modal pop-in" onClick={e=>e.stopPropagation()}>
+            <h3 style={{fontWeight:700,fontSize:17,marginBottom:8}}>Cancel Class</h3>
+            <p style={{fontSize:13,color:"#64748b",marginBottom:16}}>All enrolled students will be notified. This session will count as missed for attendance unless a make-up is added.</p>
+            <Fld label="REASON (sent to students)"><textarea className="input" placeholder="e.g. Lecturer on conference, public holiday…" value={form.cancelReason||""} onChange={e=>setForm(f=>({...f,cancelReason:e.target.value}))}/></Fld>
+            <div style={{display:"flex",gap:10,marginTop:8}}>
+              <button className="btn btn-red" style={{flex:1}} onClick={cancelSlot}>Confirm Cancellation</button>
+              <button className="btn btn-outline" onClick={()=>setModal(null)}>Back</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Unit Manager ─────────────────────────────────────────────────────────────
+function UnitManager({session,units,setUnits,classes,pushNotif,myUnits,isAdmin}){
+  const visible=isAdmin?units:myUnits;
+  const[modal,setModal]=useState(false);
+  const[editing,setEditing]=useState(null);
+  const[form,setForm]=useState({});
+
+  const openAdd=()=>{ setForm({name:"",code:"",creditHours:3,lecturerId:session.role==="lecturer"?session.id:"L01",classIds:[],active:true}); setEditing(null); setModal(true); };
+  const openEdit=u=>{ setForm({...u}); setEditing(u); setModal(true); };
+
+  const save=()=>{
+    if(!form.name||!form.code) return;
+    if(editing){ setUnits(prev=>prev.map(u=>u.id===editing.id?{...u,...form}:u)); writeAudit(session.id,"Edit unit",`${form.code}`); }
+    else { setUnits(prev=>[...prev,{...form,id:uid()}]); writeAudit(session.id,"Add unit",`${form.code} — ${form.name}`); }
+    setModal(false);
+  };
+
+  const toggleActive=id=>{
+    const u=units.find(x=>x.id===id);
+    setUnits(prev=>prev.map(x=>x.id===id?{...x,active:!x.active}:x));
+    writeAudit(session.id,u?.active?"Suspend unit":"Reinstate unit",`${u?.code}`);
+  };
+
+  return(
+    <div className="slide-in">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <h2 style={{fontWeight:700,fontSize:18}}>Units {isAdmin?"(All)":"(My Units)"}</h2>
+        <button className="btn btn-blue btn-sm" onClick={openAdd}>+ Add Unit</button>
+      </div>
+      {visible.map(u=>{
+        const lec=INIT_LECTURERS[u.lecturerId];
+        return(
+          <div key={u.id} className="card" style={{marginBottom:12,borderLeft:`4px solid ${unitColor(u.id)}`,opacity:u.active?1:.6}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
+              <div>
+                <div style={{display:"flex",gap:6,marginBottom:4,flexWrap:"wrap"}}>
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:unitColor(u.id),fontWeight:700}}>{u.code}</span>
+                  <span className="badge" style={{background:u.active?"#D1FAE5":"#FEE2E2",color:u.active?"#065F46":"#DC2626"}}>{u.active?"Active":"Suspended"}</span>
+                  <span className="badge" style={{background:"#EEF2FF",color:"#4338CA"}}>{u.creditHours} CH · {UNIT_DURATION}h/session</span>
+                </div>
+                <div style={{fontWeight:700,fontSize:15}}>{u.name}</div>
+                {isAdmin&&<div style={{fontSize:12,color:"#64748b",marginTop:1}}>{lec?.name} · {lec?.dept}</div>}
+                <div style={{fontSize:12,color:"#94a3b8",marginTop:1}}>{u.classIds.map(cid=>classes.find(c=>c.id===cid)?.code).filter(Boolean).join(", ")}</div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <button className="btn btn-ghost btn-sm" onClick={()=>openEdit(u)}>✏ Edit</button>
+                <button className="btn btn-sm" style={{background:u.active?"#FEF3C7":"#D1FAE5",color:u.active?"#92400E":"#065F46"}} onClick={()=>toggleActive(u.id)}>{u.active?"Suspend":"Reinstate"}</button>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+
+      {modal&&(
+        <div className="modal-bg" onClick={()=>setModal(false)}>
+          <div className="modal pop-in" onClick={e=>e.stopPropagation()}>
+            <h3 style={{fontWeight:700,fontSize:17,marginBottom:18}}>{editing?"Edit Unit":"Add Unit"}</h3>
+            <Fld label="UNIT NAME"><input className="input" placeholder="e.g. Engineering Mathematics III" value={form.name||""} onChange={e=>setForm(f=>({...f,name:e.target.value}))}/></Fld>
+            <Fld label="UNIT CODE"><input className="input" placeholder="e.g. MAT 301" value={form.code||""} onChange={e=>setForm(f=>({...f,code:e.target.value}))}/></Fld>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Fld label="CREDIT HOURS"><select className="input" value={form.creditHours||3} onChange={e=>setForm(f=>({...f,creditHours:Number(e.target.value)}))}>
+                {[1,2,3,4,5].map(n=><option key={n}>{n}</option>)}
+              </select></Fld>
+              {isAdmin&&<Fld label="LECTURER"><select className="input" value={form.lecturerId||"L01"} onChange={e=>setForm(f=>({...f,lecturerId:e.target.value}))}>
+                {Object.values(INIT_LECTURERS).map(l=><option key={l.id} value={l.id}>{l.name}</option>)}
+              </select></Fld>}
+            </div>
+            <Fld label="ASSIGNED CLASSES">
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:4}}>
+                {classes.map(c=>{
+                  const checked=(form.classIds||[]).includes(c.id);
+                  return(
+                    <label key={c.id} style={{display:"flex",alignItems:"center",gap:5,fontSize:13,cursor:"pointer",background:checked?"#EEF2FF":"#F8FAFF",borderRadius:8,padding:"6px 10px",border:`1px solid ${checked?"#2563EB":"#E0E7FF"}`}}>
+                      <input type="checkbox" checked={checked} onChange={()=>setForm(f=>({...f,classIds:checked?f.classIds.filter(id=>id!==c.id):[...(f.classIds||[]),c.id]}))} style={{marginRight:2}}/>
+                      {c.code}
+                    </label>
+                  );
+                })}
+              </div>
+            </Fld>
+            <div style={{display:"flex",gap:10,marginTop:10}}>
+              <button className="btn btn-blue" style={{flex:1}} onClick={save}>Save</button>
+              <button className="btn btn-outline" onClick={()=>setModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Penalty Manager ──────────────────────────────────────────────────────────
+function PenaltyManager({session,units,classes,records,setRecords,myUnits,pushNotif,semLocked}){
+  const[selUnit,setSelUnit]=useState(myUnits[0]?.id||"");
+  const unit=units.find(u=>u.id===selUnit);
+  const unitClasses=classes.filter(c=>unit?.classIds.includes(c.id));
+  const[selClass,setSelClass]=useState(unitClasses[0]?.id||"");
+  const cls=classes.find(c=>c.id===selClass);
+  const enrolled=(cls?.students||[]).map(id=>INIT_STUDENTS[id]).filter(Boolean);
+  const[penaltyModal,setPenaltyModal]=useState(null);
+  const[penaltyForm,setPenaltyForm]=useState({pts:0,note:"",forgiven:false});
+
+  const getStudentPenalty=(studentId)=>{
+    const recs=records.filter(r=>r.studentId===studentId&&r.unitId===selUnit);
+    return recs.reduce((a,r)=>a+((r.penalty||0)*(r.penaltyForgiven?0:1)),0);
+  };
+  const getBonus=(studentId)=>{
+    const recs=records.filter(r=>r.studentId===studentId&&r.unitId===selUnit);
+    const attended=recs.filter(r=>r.status==="present"||r.status==="late").length;
+    const total=20; // simplified
+    return bonusMark(Math.round(attended/total*100));
+  };
+
+  const applyPenalty=()=>{
+    if(!penaltyModal||semLocked) return;
+    const pts=Math.min(10,Math.max(0,Number(penaltyForm.pts)));
+    setRecords(prev=>{
+      const updated=[...prev];
+      // Find or create a penalty record
+      const existingIdx=updated.findIndex(r=>r.studentId===penaltyModal.id&&r.unitId===selUnit&&r.type==="penalty");
+      const rec={id:uid(),studentId:penaltyModal.id,ttId:"PENALTY",unitId:selUnit,classId:selClass,date:todayStr(),time:nowISO(),status:"penalty",penalty:pts,penaltyNote:penaltyForm.note,penaltyForgiven:penaltyForm.forgiven,synced:true};
+      if(existingIdx>=0) updated[existingIdx]={...updated[existingIdx],...rec};
+      else updated.push(rec);
+      return updated;
+    });
+    pushNotif([penaltyModal.id],penaltyForm.forgiven?"✅ Penalty Forgiven":`⚖ Late Penalty Applied`,penaltyForm.forgiven?`Your late penalty in ${unit?.name} has been forgiven by ${INIT_LECTURERS[session.id]?.name}.`:`A -${pts} mark penalty has been applied to your ${unit?.name} attendance marks. Reason: ${penaltyForm.note||"Not specified"}.`,"penalty");
+    writeAudit(session.id,penaltyForm.forgiven?"Forgive penalty":"Apply penalty",`${penaltyModal.name} in ${unit?.code}: ${penaltyForm.forgiven?"forgiven":"−"+pts} pts — ${penaltyForm.note}`);
+    setPenaltyModal(null);
+  };
+
+  return(
+    <div className="slide-in">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 style={{fontWeight:700,fontSize:18}}>Penalties & Marks</h2>
+          <p style={{fontSize:13,color:"#64748b",marginTop:2}}>Apply or forgive late penalties (max -10). Students are notified.</p>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <select className="input" style={{width:"auto",fontSize:12}} value={selUnit} onChange={e=>setSelUnit(e.target.value)}>
+            {myUnits.map(u=><option key={u.id} value={u.id}>{u.code}</option>)}
+          </select>
+          <select className="input" style={{width:"auto",fontSize:12}} value={selClass} onChange={e=>setSelClass(e.target.value)}>
+            {unitClasses.map(c=><option key={c.id} value={c.id}>{c.code}</option>)}
+          </select>
+        </div>
+      </div>
+      {semLocked&&<div style={{background:"#FEE2E2",borderRadius:10,padding:"9px 14px",fontSize:13,color:"#DC2626",marginBottom:12,fontWeight:600}}>🔒 Semester locked — no penalty changes permitted.</div>}
+      <div className="card" style={{overflowX:"auto"}}>
+        <table>
+          <thead><tr><th>Student</th><th>Attendance %</th><th>Bonus</th><th>Penalty</th><th>Net</th><th>Action</th></tr></thead>
+          <tbody>
+            {enrolled.map(s=>{
+              const penalty=getStudentPenalty(s.id);
+              const bonus=getBonus(s.id);
+              const net=Math.max(0,bonus-penalty);
+              const recs=records.filter(r=>r.studentId===s.id&&r.unitId===selUnit);
+              const attended=recs.filter(r=>r.status==="present"||r.status==="late").length;
+              const pct=Math.round(attended/20*100);
+              return(
+                <tr key={s.id}>
+                  <td><div style={{display:"flex",alignItems:"center",gap:8}}><Av i={s.photo} size={28}/><span style={{fontWeight:600}}>{s.name}</span></div></td>
+                  <td><Barpct pct={pct}/></td>
+                  <td style={{fontWeight:700,color:"#2563EB"}}>+{bonus}</td>
+                  <td style={{fontWeight:700,color:penalty>0?"#DC2626":"#94a3b8"}}>{penalty>0?`−${penalty}`:"—"}</td>
+                  <td style={{fontWeight:800,color:net>0?"#059669":"#DC2626"}}>+{net}</td>
+                  <td>{!semLocked&&<button className="btn btn-ghost btn-sm" onClick={()=>{setPenaltyModal(s);setPenaltyForm({pts:penalty||0,note:"",forgiven:false});}}>⚖ Manage</button>}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {penaltyModal&&(
+        <div className="modal-bg" onClick={()=>setPenaltyModal(null)}>
+          <div className="modal pop-in" onClick={e=>e.stopPropagation()}>
+            <h3 style={{fontWeight:700,fontSize:17,marginBottom:4}}>Manage Marks</h3>
+            <p style={{fontSize:13,color:"#64748b",marginBottom:16}}>{penaltyModal.name} · {unit?.code}</p>
+            <Fld label="PENALTY MARKS (0–10)">
+              <input className="input" type="number" min={0} max={10} value={penaltyForm.pts} onChange={e=>setPenaltyForm(f=>({...f,pts:Math.min(10,Math.max(0,Number(e.target.value)))}))}/>
+            </Fld>
+            <Fld label="REASON / NOTE">
+              <textarea className="input" placeholder="Reason for penalty or forgiveness…" value={penaltyForm.note} onChange={e=>setPenaltyForm(f=>({...f,note:e.target.value}))}/>
+            </Fld>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer",marginBottom:16}}>
+              <input type="checkbox" checked={penaltyForm.forgiven} onChange={e=>setPenaltyForm(f=>({...f,forgiven:e.target.checked}))} style={{width:16,height:16}}/>
+              Forgive / waive this penalty (student will be notified)
+            </label>
+            <div style={{display:"flex",gap:10}}>
+              <button className="btn btn-blue" style={{flex:1}} onClick={applyPenalty}>Apply</button>
+              <button className="btn btn-outline" onClick={()=>setPenaltyModal(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Lecturer QR ──────────────────────────────────────────────────────────────
+function LecturerQR({session,units,classes,myUnits,qrReady}){
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:6}}>Class QR Codes</h2>
+      <div style={{background:"#EEF2FF",borderRadius:12,padding:"12px 16px",marginBottom:18,fontSize:13,color:"#4338CA"}}>
+        🖨 Print these and hand them to your <strong>class representative</strong> for safekeeping. The same QR is used by you to open the session and by students to mark attendance.
+      </div>
+      <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+        {myUnits.flatMap(u=>classes.filter(c=>u.classIds.includes(c.id)).map(c=>(
+          <QRCard key={`${u.id}-${c.id}`} unit={u} cls={c} qrReady={qrReady} payload={`ATTENDEASE:CLASS:${c.id}:UNIT:${u.id}`}/>
+        )))}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ADMIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+function AdminApp(props){
+  const{session,notifs,appeals=[],units,timetable,records,lecRecs,classes,semLocked,setSemLocked}=props;
+  const myNotifs=notifs.filter(n=>n.toIds==="all"||n.toIds?.includes("ADMIN")||n.toIds==="lecturers");
+  const[tab,setTab]=useState("today");
+
+  const navItems=[
+    {id:"today",    icon:"📊",label:"Today's Overview",    badge:0},
+    {id:"timetable",icon:"📅",label:"Master Timetable",    badge:0},
+    {id:"units",    icon:"📚",label:"All Units",           badge:0},
+    {id:"classes",  icon:"🏫",label:"Classes & Students",  badge:0},
+    {id:"lecturers",icon:"👤",label:"Lecturers",           badge:0},
+    {id:"semester", icon:"🗂",label:"Semester Archive",    badge:0},
+    {id:"audit",    icon:"🔍",label:"Audit Log",           badge:0},
+    {id:"broadcast",icon:"📢",label:"Broadcast",           badge:0},
+    {id:"notifs",   icon:"🔔",label:"Notifications",       badge:myNotifs.length},
+  ];
+
+  return(
+    <Shell {...props} navItems={navItems} activeTab={tab} setActiveTab={setTab} accent="#7C3AED">
+      {tab==="today"    && <AdminToday    {...props}/>}
+      {tab==="timetable"&& <TimetableManager {...props} myUnits={units.filter(u=>u.active)} role="admin" isAdmin/>}
+      {tab==="units"    && <UnitManager   {...props} myUnits={units} isAdmin/>}
+      {tab==="classes"  && <AdminClasses  {...props}/>}
+      {tab==="lecturers"&& <AdminLecturers{...props}/>}
+      {tab==="semester" && <SemesterArchive{...props}/>}
+      {tab==="audit"    && <AuditLog/>}
+      {tab==="broadcast"&& <Broadcast     {...props}/>}
+      {tab==="notifs"   && <NotifList notifs={myNotifs}/>}
+    </Shell>
+  );
+}
+
+// ─── Admin: Today ─────────────────────────────────────────────────────────────
+function AdminToday({units,classes,timetable,records,lecRecs,pushNotif,session}){
+  const dow=todayDow();
+  const todaySlots=timetable.filter(t=>t.day===dow&&!t.cancelled);
+
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:20,marginBottom:18}}>Today's Overview — {new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}</h2>
+
+      {todaySlots.length===0?(
+        <div className="card" style={{textAlign:"center",padding:40,color:"#94a3b8"}}>No classes scheduled today.</div>
+      ):todaySlots.map(tt=>{
+        const unit=units.find(u=>u.id===tt.unitId);
+        const cls=classes.find(c=>c.id===tt.classId);
+        const lec=INIT_LECTURERS[unit?.lecturerId||""];
+        const st=slotStatus(tt);
+        const lecCheckedIn=lecRecs.find(r=>r.lecturerId===unit?.lecturerId&&r.ttId===tt.id&&r.date===todayStr());
+        const enrolled=(cls?.students||[]).map(id=>INIT_STUDENTS[id]).filter(Boolean).filter(s=>s.status!=="deferred");
+        const studentRecs=records.filter(r=>r.ttId===tt.id&&r.date===todayStr());
+        const present=studentRecs.filter(r=>r.status==="present"||r.status==="late").length;
+        const pct=enrolled.length>0?Math.round(present/enrolled.length*100):0;
+        return(
+          <div key={tt.id} className="card" style={{marginBottom:14,border:st.live?"2px solid #DC2626":"2px solid transparent"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12,marginBottom:12}}>
+              <div>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:4}}>
+                  {st.live&&<span className="live-dot"/>}
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:13,fontWeight:700,color:unitColor(unit?.id||"")}}>{unit?.code}</span>
+                  {st.live&&<span className="badge" style={{background:"#FEE2E2",color:"#DC2626"}}>🔴 LIVE</span>}
+                  {st.status==="upcoming"&&<span className="badge" style={{background:"#EEF2FF",color:"#2563EB"}}>in {st.minsUntil}m</span>}
+                  {st.status==="ended"&&<span className="badge" style={{background:"#F8FAFF",color:"#94a3b8"}}>Ended</span>}
+                </div>
+                <div style={{fontWeight:700,fontSize:16}}>{unit?.name}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{tt.startTime}–{addHrs(tt.startTime,UNIT_DURATION)} · {tt.room} · {cls?.code}</div>
+              </div>
+              {/* Lecturer status */}
+              <div style={{background:lecCheckedIn?"#D1FAE5":"#FEE2E2",borderRadius:12,padding:"10px 16px",textAlign:"center",minWidth:130}}>
+                <div style={{fontSize:11,fontWeight:600,color:lecCheckedIn?"#065F46":"#DC2626",marginBottom:2}}>LECTURER</div>
+                <div style={{display:"flex",alignItems:"center",gap:6,justifyContent:"center"}}>
+                  <Av i={lec?.photo||"LEC"} size={24} g={lecCheckedIn?"135deg,#059669,#34d399":"135deg,#DC2626,#f87171"}/>
+                  <span style={{fontWeight:600,fontSize:13,color:lecCheckedIn?"#065F46":"#DC2626"}}>{lec?.name?.split(" ")[0]}</span>
+                </div>
+                <div style={{fontSize:11,color:lecCheckedIn?"#065F46":"#DC2626",marginTop:2}}>{lecCheckedIn?"✓ Checked in":"✗ Not checked in"}</div>
+              </div>
+            </div>
+            {/* Student attendance bar */}
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:6}}>
+                <span style={{fontWeight:600}}>Student Attendance</span>
+                <span style={{color:"#64748b"}}>{present}/{enrolled.length} present</span>
+              </div>
+              <div style={{height:7,background:"#EEF2FF",borderRadius:99,overflow:"hidden",marginBottom:8}}>
+                <div style={{width:`${pct}%`,height:"100%",background:pct>=75?"#059669":pct>=50?"#F59E0B":"#DC2626",borderRadius:99,transition:"width .6s"}}/>
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {enrolled.slice(0,12).map(s=>{
+                  const r=studentRecs.find(x=>x.studentId===s.id);
+                  return(
+                    <div key={s.id} title={`${s.name}: ${r?r.status:"absent"}`} style={{width:28,height:28,borderRadius:"50%",background:r?(r.status==="late"?"#FEF3C7":"#D1FAE5"):"#FEE2E2",border:`2px solid ${r?(r.status==="late"?"#D97706":"#059669"):"#DC2626"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,color:r?(r.status==="late"?"#92400E":"#065F46"):"#DC2626"}}>
+                      {s.photo}
+                    </div>
+                  );
+                })}
+                {enrolled.length>12&&<div style={{width:28,height:28,borderRadius:"50%",background:"#EEF2FF",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"#6B7FBD",fontWeight:700}}>+{enrolled.length-12}</div>}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Admin: Classes ───────────────────────────────────────────────────────────
+function AdminClasses({classes,setClasses,units,records,session,pushNotif}){
+  const[modal,setModal]=useState(false);
+  const[editing,setEditing]=useState(null);
+  const[form,setForm]=useState({});
+  const[importing,setImporting]=useState(false);
+
+  const importFromMoodle=async()=>{
+    setImporting(true);
+    await delay(1500);
+    setImporting(false);
+    pushNotif(["ADMIN"],"✅ Moodle Sync Complete","Classes and student data synced from elearning.tum.ac.ke","info");
+    writeAudit(session.id,"Moodle import","Classes synced from Moodle");
+  };
+
+  const openAdd=()=>{ setForm({code:"",name:"",intakeYear:2024,intakeSem:"September",currentYear:1,students:[],hodId:"H01"}); setEditing(null); setModal(true); };
+  const openEdit=c=>{ setForm({...c}); setEditing(c); setModal(true); };
+
+  const save=()=>{
+    if(!form.code||!form.name) return;
+    if(editing){ setClasses(prev=>prev.map(c=>c.id===editing.id?{...c,...form}:c)); }
+    else { setClasses(prev=>[...prev,{...form,id:uid()}]); }
+    writeAudit(session.id,editing?"Edit class":"Add class",form.code);
+    setModal(false);
+  };
+
+  return(
+    <div className="slide-in">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <h2 style={{fontWeight:700,fontSize:18}}>Classes & Students</h2>
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn btn-purple btn-sm" onClick={importFromMoodle} disabled={importing}>
+            {importing?<><Spinner/>Syncing…</>:"🔄 Import from Moodle"}
+          </button>
+          <button className="btn btn-blue btn-sm" onClick={openAdd}>+ Add Class</button>
+        </div>
+      </div>
+      {classes.map(cls=>{
+        const students=(cls.students||[]).map(id=>INIT_STUDENTS[id]).filter(Boolean);
+        const activeStudents=students.filter(s=>s.status!=="deferred");
+        return(
+          <div key={cls.id} className="card" style={{marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:4}}>
+                  <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:13,fontWeight:800,color:"#7C3AED"}}>{cls.code}</span>
+                  <span className="badge" style={{background:"#EEF2FF",color:"#4338CA"}}>Year {cls.currentYear}</span>
+                  <span className="badge" style={{background:"#F3E8FF",color:"#7C3AED"}}>{cls.intakeSem} {cls.intakeYear}</span>
+                </div>
+                <div style={{fontWeight:700,fontSize:15}}>{cls.name}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:1}}>{activeStudents.length} active · {students.length-activeStudents.length} deferred</div>
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={()=>openEdit(cls)}>✏ Edit</button>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {students.slice(0,8).map(s=>(
+                <div key={s.id} style={{display:"flex",alignItems:"center",gap:5,background:s.status==="deferred"?"#FEF2F2":"#F8FAFF",borderRadius:8,padding:"4px 10px",fontSize:12,border:`1px solid ${s.status==="deferred"?"#FECACA":"#E0E7FF"}`}}>
+                  <Av i={s.photo} size={18} g={s.status==="deferred"?"135deg,#DC2626,#f87171":"135deg,#2563EB,#0ea5e9"}/>
+                  <span style={{fontWeight:500}}>{s.name.split(" ")[0]}</span>
+                  {s.status==="deferred"&&<span style={{color:"#DC2626",fontSize:10}}>deferred</span>}
+                </div>
+              ))}
+              {students.length>8&&<div style={{background:"#EEF2FF",borderRadius:8,padding:"4px 10px",fontSize:12,color:"#6B7FBD"}}>+{students.length-8} more</div>}
+            </div>
+          </div>
+        );
+      })}
+
+      {modal&&(
+        <div className="modal-bg" onClick={()=>setModal(false)}>
+          <div className="modal pop-in" onClick={e=>e.stopPropagation()}>
+            <h3 style={{fontWeight:700,fontSize:17,marginBottom:18}}>{editing?"Edit Class":"Add Class"}</h3>
+            <Fld label="CLASS CODE"><input className="input" placeholder="e.g. BSCS/SEP/2024" value={form.code||""} onChange={e=>setForm(f=>({...f,code:e.target.value}))}/></Fld>
+            <Fld label="PROGRAMME NAME"><input className="input" placeholder="e.g. BSc Computer Science" value={form.name||""} onChange={e=>setForm(f=>({...f,name:e.target.value}))}/></Fld>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Fld label="INTAKE YEAR"><input className="input" type="number" value={form.intakeYear||2024} onChange={e=>setForm(f=>({...f,intakeYear:Number(e.target.value)}))}/></Fld>
+              <Fld label="INTAKE SEMESTER"><select className="input" value={form.intakeSem||"September"} onChange={e=>setForm(f=>({...f,intakeSem:e.target.value}))}>
+                {["January","May","September"].map(s=><option key={s}>{s}</option>)}
+              </select></Fld>
+            </div>
+            <Fld label="CURRENT YEAR OF STUDY"><select className="input" value={form.currentYear||1} onChange={e=>setForm(f=>({...f,currentYear:Number(e.target.value)}))}>
+              {[1,2,3,4].map(n=><option key={n}>Year {n}</option>)}
+            </select></Fld>
+            <div style={{background:"#FEF9C3",borderRadius:10,padding:"9px 13px",fontSize:12,color:"#92400E"}}>
+              💡 Student registration and enrolment status is read daily from elearning.tum.ac.ke. Use "Import from Moodle" to sync now.
+            </div>
+            <div style={{display:"flex",gap:10,marginTop:14}}>
+              <button className="btn btn-blue" style={{flex:1}} onClick={save}>Save Class</button>
+              <button className="btn btn-outline" onClick={()=>setModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Admin: Lecturers ─────────────────────────────────────────────────────────
+function AdminLecturers({units,timetable,lecRecs}){
+  const lecs=Object.values(INIT_LECTURERS);
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:16}}>Lecturers</h2>
+      {lecs.map(l=>{
+        const myUnits=units.filter(u=>u.lecturerId===l.id&&u.active);
+        const mySlots=timetable.filter(t=>myUnits.some(u=>u.id===t.unitId)&&!t.cancelled);
+        const myRecs=lecRecs.filter(r=>r.lecturerId===l.id);
+        const pct=mySlots.length>0?Math.round(myRecs.length/mySlots.length*100):0;
+        return(
+          <div key={l.id} className="card" style={{marginBottom:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:14}}>
+              <Av i={l.photo} size={46} g="135deg,#7C3AED,#a78bfa"/>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:700,fontSize:16}}>{l.name}</div>
+                <div style={{fontSize:12,color:"#64748b"}}>{l.email} · {l.dept}</div>
+                <div style={{fontSize:12,color:"#94a3b8",marginTop:1}}>{myUnits.length} active unit{myUnits.length!==1?"s":""} · {myRecs.length}/{mySlots.length} sessions delivered</div>
+              </div>
+              <div style={{textAlign:"center",minWidth:70}}>
+                <div style={{fontSize:26,fontWeight:800,color:pct>=80?"#059669":"#D97706"}}>{pct}%</div>
+                <div style={{fontSize:11,color:"#94a3b8"}}>Attendance</div>
+                <Barpct pct={pct}/>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Semester Archive ─────────────────────────────────────────────────────────
+function SemesterArchive({session,semLocked,setSemLocked,records,units,classes,pushNotif,writeAudit}){
+  const[confirm,setConfirm]=useState(false);
+  const lockSemester=()=>{
+    setSemLocked(true);
+    pushNotif("all","🔒 Semester Locked","The current semester has been locked by admin. All attendance records are now final. No further edits are permitted.","info");
+    writeAudit(session.id,"Semester lock","Semester 2 2025 locked — records frozen");
+    setConfirm(false);
+  };
+  const exportAll=()=>{
+    const rows=[["Student","Adm No","Class","Unit","Attended","Late","Absent","Total","Rate%","Bonus","Penalty","Net","Standing"]];
+    classes.forEach(cls=>{
+      cls.students.forEach(sId=>{
+        const s=INIT_STUDENTS[sId]; if(!s) return;
+        units.filter(u=>u.classIds.includes(cls.id)&&u.active).forEach(u=>{
+          const recs=records.filter(r=>r.studentId===sId&&r.unitId===u.id);
+          const attended=recs.filter(r=>r.status==="present"||r.status==="late").length;
+          const lateCount=recs.filter(r=>r.status==="late").length;
+          const total=20;
+          const pct=Math.round(attended/total*100);
+          const bonus=bonusMark(pct);
+          const penalty=recs.reduce((a,r)=>a+((r.penalty||0)*(r.penaltyForgiven?0:1)),0);
+          const net=Math.max(0,bonus-penalty);
+          rows.push([s.name,s.adm,cls.code,u.code,attended,lateCount,total-attended,total,pct,bonus,penalty,net,standing(pct).l]);
+        });
+      });
+    });
+    const csv=rows.map(r=>r.join(",")).join("\n");
+    const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);a.download=`TUM_Attendance_Sem2_2025${semLocked?"_FINAL":""}.csv`;a.click();
+    writeAudit(session.id,"Export all CSV",semLocked?"FINAL export (locked)":"Draft export");
+  };
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:6}}>Semester Archive</h2>
+      <p style={{fontSize:13,color:"#64748b",marginBottom:18}}>Lock the semester to freeze all attendance records. After locking, no lecturer can modify marks or penalties.</p>
+      <div className="card" style={{marginBottom:16,borderTop:`4px solid ${semLocked?"#DC2626":"#7C3AED"}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:16,marginBottom:4}}>Semester 2 · 2024/2025</div>
+            <div style={{fontSize:13,color:"#64748b"}}>Status: <strong style={{color:semLocked?"#DC2626":"#059669"}}>{semLocked?"🔒 LOCKED — Records Frozen":"🟢 Open"}</strong></div>
+          </div>
+          <div style={{display:"flex",gap:10}}>
+            <button className="btn btn-green" onClick={exportAll}>📥 Export All CSV{semLocked?" (FINAL)":""}</button>
+            {!semLocked&&<button className="btn btn-red" onClick={()=>setConfirm(true)}>🔒 Lock Semester</button>}
+          </div>
+        </div>
+      </div>
+      {semLocked&&<div style={{background:"#FEE2E2",borderRadius:12,padding:"14px 18px",fontSize:13,color:"#DC2626",fontWeight:500}}>
+        ⚠ This semester is locked. All records are final. To make changes, contact your system administrator to unlock.
+      </div>}
+      {confirm&&(
+        <div className="modal-bg">
+          <div className="modal pop-in" style={{textAlign:"center"}}>
+            <div style={{fontSize:44,marginBottom:10}}>🔒</div>
+            <h3 style={{fontWeight:700,fontSize:18,marginBottom:8}}>Lock Semester?</h3>
+            <p style={{color:"#64748b",fontSize:13,lineHeight:1.6,marginBottom:20}}>This will <strong>permanently freeze</strong> all attendance records for Semester 2 · 2024/2025. Lecturers will no longer be able to edit marks or penalties. This action cannot be undone.</p>
+            <div style={{display:"flex",gap:12}}>
+              <button className="btn btn-red" style={{flex:1}} onClick={lockSemester}>Yes, Lock Semester</button>
+              <button className="btn btn-outline" style={{flex:1}} onClick={()=>setConfirm(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
+function AuditLog(){
+  const log=loadAudit();
+  const roleColor={S:"#2563EB",L:"#059669",ADMIN:"#7C3AED",SYSTEM:"#94a3b8"};
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:16}}>Audit Log</h2>
+      {log.length===0?<div className="card" style={{textAlign:"center",padding:36,color:"#94a3b8"}}>No audit entries yet.</div>
+      :<div className="card" style={{overflowX:"auto"}}>
+        <table>
+          <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead>
+          <tbody>
+            {log.map(e=>{
+              const prefix=e.actor.slice(0,1);
+              return(
+                <tr key={e.id}>
+                  <td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"#94a3b8",whiteSpace:"nowrap"}}>{fmtFull(e.at)}</td>
+                  <td><span className="badge" style={{background:`${roleColor[prefix]||"#94a3b8"}15`,color:roleColor[prefix]||"#94a3b8"}}>{e.actor}</span></td>
+                  <td style={{fontWeight:600,fontSize:13}}>{e.action}</td>
+                  <td style={{fontSize:12,color:"#64748b"}}>{e.detail}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>}
+    </div>
+  );
+}
+
+// ─── Broadcast ────────────────────────────────────────────────────────────────
+function Broadcast({session,pushNotif,notifs}){
+  const[form,setForm]=useState({title:"",body:"",to:"all"});
+  const send=()=>{
+    if(!form.title||!form.body) return;
+    pushNotif(form.to,form.title,form.body,"info");
+    writeAudit(session.id,"Broadcast",`To: ${form.to} — "${form.title}"`);
+    setForm({title:"",body:"",to:"all"});
+  };
+  return(
+    <div className="slide-in">
+      <h2 style={{fontWeight:700,fontSize:18,marginBottom:16}}>Broadcast Notification</h2>
+      <div className="card" style={{maxWidth:520,marginBottom:20}}>
+        <Fld label="SEND TO"><select className="input" value={form.to} onChange={e=>setForm(f=>({...f,to:e.target.value}))}>
+          <option value="all">Everyone</option>
+          <option value="students">All Students</option>
+          <option value="lecturers">All Lecturers</option>
+        </select></Fld>
+        <Fld label="TITLE"><input className="input" placeholder="Notification title" value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))}/></Fld>
+        <Fld label="MESSAGE"><textarea className="input" placeholder="Message…" value={form.body} onChange={e=>setForm(f=>({...f,body:e.target.value}))}/></Fld>
+        <button className="btn btn-blue" style={{width:"100%"}} onClick={send}>📢 Send</button>
+      </div>
+      <h3 style={{fontWeight:600,fontSize:14,marginBottom:10}}>Recent broadcasts</h3>
+      <NotifList notifs={notifs.slice(0,8)}/>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SHARED MICRO-COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+function QRCard({unit,cls,qrReady,payload}){
+  const ref=useRef(null); const made=useRef(false);
+  useEffect(()=>{
+    if(!qrReady||!ref.current||made.current) return; made.current=true; ref.current.innerHTML="";
+    new window.QRCode(ref.current,{text:payload,width:160,height:160,colorDark:"#0a0f2e",colorLight:"#fff",correctLevel:window.QRCode?.CorrectLevel?.H});
+  },[qrReady,payload]);
+  const col=unitColor(unit.id);
+  return(
+    <div className="card" style={{width:230,textAlign:"center",border:`2px solid ${col}22`}}>
+      <div style={{background:`linear-gradient(135deg,${col},${col}99)`,borderRadius:10,padding:"10px 14px",marginBottom:12,color:"#fff"}}>
+        <div style={{fontWeight:800,fontSize:14}}>{unit.code}</div>
+        <div style={{opacity:.85,fontSize:12,marginTop:1}}>{cls?.code}</div>
+      </div>
+      <div ref={ref} style={{display:"flex",justifyContent:"center",marginBottom:10}}/>
+      <div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>Hand to class representative</div>
+      <button className="btn btn-ghost btn-sm" style={{width:"100%"}} onClick={()=>{const c=ref.current?.querySelector("canvas");if(c){const a=document.createElement("a");a.href=c.toDataURL();a.download=`${unit.code}_${cls?.code}_QR.png`;a.click();}}}>↓ Download PNG</button>
+    </div>
+  );
+}
+
+function NotifList({notifs}){
+  if(!notifs.length) return <div className="card" style={{textAlign:"center",padding:40,color:"#94a3b8"}}><div style={{fontSize:32,marginBottom:8}}>🔔</div>No notifications.</div>;
+  const tc={reschedule:"#D97706",reminder:"#2563EB",penalty:"#7C3AED",warning:"#DC2626",info:"#059669"};
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {notifs.map(n=>(
+        <div key={n.id} className="card-sm" style={{borderLeft:`4px solid ${tc[n.type]||"#94a3b8"}`}}>
+          <div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{n.title}</div>
+          <div style={{fontSize:12,color:"#64748b",lineHeight:1.5}}>{n.body}</div>
+          <div style={{fontSize:11,color:"#94a3b8",marginTop:5}}>{fmtFull(n.time)}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Av({i,size=36,g="135deg,#2563EB,#0ea5e9"}){
+  return <div style={{width:size,height:size,borderRadius:"50%",background:`linear-gradient(${g})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:Math.max(9,size*.28),fontWeight:700,color:"#fff",flexShrink:0}}>{i}</div>;
+}
+function Barpct({pct}){
+  const c=pct>=75?"#059669":pct>=60?"#F59E0B":"#DC2626";
+  return(<div style={{display:"flex",alignItems:"center",gap:6}}><div style={{width:50,height:5,background:"#EEF2FF",borderRadius:99,overflow:"hidden"}}><div style={{width:`${pct}%`,height:"100%",background:c,borderRadius:99}}/></div><span style={{fontSize:12,fontWeight:700,color:c}}>{pct}%</span></div>);
+}
+function Fld({label,children}){
+  return <div style={{marginBottom:12}}><label style={{fontSize:11,fontWeight:600,color:"#374151",display:"block",marginBottom:5,letterSpacing:".06em"}}>{label}</label>{children}</div>;
+}
+function Spinner(){
+  return <span className="spin" style={{width:13,height:13,border:"2px solid rgba(255,255,255,.3)",borderTop:"2px solid #fff",borderRadius:"50%",display:"inline-block",flexShrink:0}}/>;
+}
+
+
+// ─── Mount ───────────────────────────────────────────────────────────────────
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+
+// Hide loading screen once React has mounted
+requestAnimationFrame(() => {
+  setTimeout(() => {
+    const ld = document.getElementById('loading');
+    if (ld) { ld.style.opacity = '0'; setTimeout(() => ld.remove(), 400); }
+  }, 600);
+});
+</script>
+
+</body>
+</html>
